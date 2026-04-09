@@ -4,7 +4,14 @@
       "Bash(npx bun run learn-examples/01-minimal-agent.ts)",
       "Bash(npx bun run learn-examples/02-real-llm-agent.ts)",
       "Read(//c/Users/admin/.claude/**)",
-      "Bash(timeout 30 bun run learn-examples/02-real-llm-agent.ts)"
+      "Bash(timeout 30 bun run learn-examples/02-real-llm-agent.ts)",
+      "Bash(npx tsc --noEmit learn-examples/04-multi-agent.ts)",
+      "Bash(bunx tsc --noEmit --skipLibCheck)",
+      "Bash(bunx tsc --noEmit --skipLibCheck --project tsconfig.json)",
+      "Bash(bunx tsc --noEmit --skipLibCheck learn-examples/04-multi-agent.ts --types bun --moduleResolution bundler --module ESNext --target ESNext --esModuleInterop)",
+      "Bash(bun install)",
+      "Bash(bun add -d bun-types)",
+      "Bash(bun run learn-examples/04-multi-agent.ts)"
     ],
     "additionalDirectories": [
       "e:\\code\\claude-code\\.claude\\skills\\teach-me\\records"
