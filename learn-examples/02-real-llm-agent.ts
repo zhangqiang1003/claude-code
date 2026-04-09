@@ -9,6 +9,7 @@
  */
 
 import * as readline from 'readline'
+import { appendFileSync, mkdirSync } from 'node:fs'
 
 // ============================================
 // 配置
@@ -207,48 +208,117 @@ async function callGLM(messages: Message[], tools: Tool[]): Promise<Message> {
       tools: toolsToGLMFormat(tools),
       temperature: 0.7,
       max_tokens: 1024,
+      stream: true,
     }),
   })
 
-  const data = await response.json() as any
-  const elapsed = Date.now() - startTime
-  console.log(`✅ GLM 响应 (${elapsed}ms)`)
-
-  // 调试：打印完整响应
-  console.log('📦 响应数据:', JSON.stringify(data, null, 2).slice(0, 500))
+  // ============================================
+  // 流式响应处理
+  // ============================================
 
   if (!response.ok) {
-    console.error('❌ GLM API 错误:', data)
+    const errorData = await response.json() as any
+    console.error('❌ GLM API 错误:', errorData)
     return {
       role: 'assistant',
-      content: `API 调用失败: ${JSON.stringify(data)}`
+      content: `API 调用失败: ${JSON.stringify(errorData)}`
     }
   }
 
-  // 3. 解析响应
-  const choice = data.choices[0]
+  const reader = response.body!.getReader()
+  const decoder = new TextDecoder()
 
-  if (choice.finish_reason === 'tool_calls' && choice.message.tool_calls) {
-    // LLM 想要调用工具
-    const toolCalls = choice.message.tool_calls
+  // 累积的内容
+  let fullContent = ''
+  let finishReason = ''
+  const toolCalls: { id: string; name: string; arguments: string }[] = []
+
+  // 用于处理跨 chunk 的不完整数据
+  let buffer = ''
+
+  console.log('📝 流式输出: ')
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    // 将新数据追加到 buffer
+    buffer += decoder.decode(value, { stream: true })
+
+    // 按双换行符分割 SSE 事件
+    const lines = buffer.split('\n')
+    buffer = lines.pop() || ''  // 保留最后一个不完整的行
+
+    for (const line of lines) {
+      // 跳过空行
+      if (!line.trim()) continue
+
+      // SSE 格式: "data: {...}"
+      if (line.startsWith('data: ')) {
+        const jsonStr = line.slice(6)  // 去掉 "data: "
+
+        // 流结束标记
+        if (jsonStr === '[DONE]') {
+          continue
+        }
+
+        try {
+          const data = JSON.parse(jsonStr)
+          const delta = data.choices?.[0]?.delta
+          finishReason = data.choices?.[0]?.finish_reason || finishReason
+
+          if (delta) {
+            // 1. 文本内容
+            if (delta.content) {
+              fullContent += delta.content
+              // 实时输出（不换行）
+              process.stdout.write(delta.content)
+            }
+
+            // 2. 工具调用（流式返回）
+            if (delta.tool_calls) {
+              for (const tc of delta.tool_calls) {
+                const idx = tc.index ?? 0
+                if (!toolCalls[idx]) {
+                  toolCalls[idx] = { id: tc.id || '', name: '', arguments: '' }
+                }
+                if (tc.id) toolCalls[idx].id = tc.id
+                if (tc.function?.name) toolCalls[idx].name = tc.function.name
+                if (tc.function?.arguments) toolCalls[idx].arguments += tc.function.arguments
+              }
+            }
+          }
+        } catch (e) {
+          // JSON 解析失败，可能是数据不完整
+          // console.log('解析错误:', e)
+        }
+      }
+    }
+  }
+
+  const elapsed = Date.now() - startTime
+  console.log(`\n\n✅ 流式响应完成 (${elapsed}ms)`)
+
+  // 处理工具调用
+  if (finishReason === 'tool_calls' && toolCalls.length > 0) {
     return {
       role: 'assistant',
       content: [
-        { type: 'text', text: choice.message.content || '' },
+        { type: 'text', text: fullContent },
         ...toolCalls.map(tc => ({
           type: 'tool_use' as const,
-          name: tc.function.name,
-          input: JSON.parse(tc.function.arguments),
+          name: tc.name,
+          input: JSON.parse(tc.arguments),
           tool_use_id: tc.id,
         }))
       ]
     }
   }
 
-  // LLM 直接回答
+  // 普通文本回答
   return {
     role: 'assistant',
-    content: choice.message.content || '（无响应）'
+    content: fullContent || '（无响应）'
   }
 }
 
@@ -394,6 +464,188 @@ async function* agentLoop(
 }
 
 // ============================================
+// Memory 持久化（参考 Claude Code 三层方案）
+// ============================================
+//
+// 第一层：JSONL 对话历史 — 实时追加，崩溃安全
+// 第二层：Compaction — 消息过多时智能压缩
+// 第三层：Memory 摘要 — 跨会话持久记忆
+//
+
+const MEMORY_DIR = 'learn-examples/.agent-memory'
+const TRANSCRIPT_FILE = `${MEMORY_DIR}/transcript.jsonl`
+const SUMMARY_FILE = `${MEMORY_DIR}/summary.md`
+const COMPACTION_THRESHOLD = 30  // 超过 N 条消息时触发压缩
+const KEEP_RECENT = 10           // 压缩后保留最近 N 条
+
+class MemoryManager {
+  private transcriptPath: string
+  private summaryPath: string
+  private compactionThreshold: number
+  private keepRecent: number
+
+  constructor(opts: {
+    transcriptPath: string
+    summaryPath: string
+    compactionThreshold: number
+    keepRecent: number
+  }) {
+    this.transcriptPath = opts.transcriptPath
+    this.summaryPath = opts.summaryPath
+    this.compactionThreshold = opts.compactionThreshold
+    this.keepRecent = opts.keepRecent
+  }
+
+  // ---- 第一层：JSONL 对话历史 ----
+
+  /** 追加一条消息到 JSONL 文件（崩溃安全） */
+  append(message: Message): void {
+    // 确保目录存在
+    mkdirSync(MEMORY_DIR, { recursive: true })
+
+    const line = JSON.stringify({
+      role: message.role,
+      content: message.content,
+      ts: new Date().toISOString(),
+    }) + '\n'
+
+    // 追加写入（不是覆盖）
+    appendFileSync(this.transcriptPath, line, 'utf-8')
+  }
+
+  /** 从 JSONL 文件加载所有消息 */
+  async loadTranscript(): Promise<Message[]> {
+    try {
+      const file = Bun.file(this.transcriptPath)
+      const text = await file.text()
+      const lines = text.trim().split('\n').filter(Boolean)
+
+      return lines.map(line => {
+        const obj = JSON.parse(line)
+        return {
+          role: obj.role,
+          content: obj.content,
+        } as Message
+      })
+    } catch {
+      return []
+    }
+  }
+
+  // ---- 第二层：Compaction 压缩 ----
+
+  /** 检查是否需要压缩，如果需要则执行 */
+  async compactIfNeeded(messages: Message[]): Promise<Message[]> {
+    const nonSystem = messages.filter(m => m.role !== 'system')
+    if (nonSystem.length <= this.compactionThreshold) {
+      return messages  // 不需要压缩
+    }
+
+    console.log(`\n📦 触发压缩：${nonSystem.length} 条消息 → 保留最近 ${this.keepRecent} 条`)
+
+    // 1. 提取要压缩的旧消息
+    const systemMsg = messages.find(m => m.role === 'system')
+    const oldMessages = nonSystem.slice(0, -this.keepRecent)
+    const recentMessages = nonSystem.slice(-this.keepRecent)
+
+    // 2. 将旧消息生成摘要
+    const summary = this.generateSummary(oldMessages)
+    await this.saveSummary(summary)
+
+    // 3. 重构：system + summary + 最近消息
+    const result: Message[] = []
+    if (systemMsg) result.push(systemMsg)
+
+    // 把摘要作为一条 system 消息插入
+    result.push({
+      role: 'system',
+      content: `# 历史对话摘要\n\n${summary}`,
+    })
+
+    result.push(...recentMessages)
+
+    // 4. 重写 JSONL（只保留压缩后的消息）
+    await this.rewriteTranscript(result)
+
+    return result
+  }
+
+  /** 简单摘要生成（不调 LLM，直接提取关键信息） */
+  private generateSummary(messages: Message[]): string {
+    const userMessages = messages
+      .filter(m => m.role === 'user' && typeof m.content === 'string')
+      .map(m => `- 用户问: ${(m.content as string).slice(0, 100)}`)
+
+    const assistantMessages = messages
+      .filter(m => m.role === 'assistant' && typeof m.content === 'string')
+      .map(m => `- AI 答: ${(m.content as string).slice(0, 100)}`)
+
+    const parts: string[] = []
+    if (userMessages.length > 0) {
+      parts.push('## 用户问题\n' + userMessages.slice(-5).join('\n'))
+    }
+    if (assistantMessages.length > 0) {
+      parts.push('## AI 回答\n' + assistantMessages.slice(-5).join('\n'))
+    }
+
+    return parts.join('\n\n') || '（无历史记录）'
+  }
+
+  /** 重写 JSONL 文件（压缩后） */
+  private async rewriteTranscript(messages: Message[]): Promise<void> {
+    mkdirSync(MEMORY_DIR, { recursive: true })
+    const lines = messages.map(m =>
+      JSON.stringify({ role: m.role, content: m.content, ts: new Date().toISOString() })
+    ).join('\n') + '\n'
+
+    await Bun.write(this.transcriptPath, lines)
+  }
+
+  // ---- 第三层：Memory 摘要 ----
+
+  /** 加载之前的摘要 */
+  async loadSummary(): Promise<string> {
+    try {
+      const file = Bun.file(this.summaryPath)
+      return await file.text()
+    } catch {
+      return ''
+    }
+  }
+
+  /** 保存摘要到文件 */
+  private async saveSummary(summary: string): Promise<void> {
+    const header = `# 对话记忆摘要\n> 自动生成于 ${new Date().toLocaleString('zh-CN')}\n\n`
+    await Bun.write(this.summaryPath, header + summary, { createPath: true })
+  }
+
+  // ---- 初始化 ----
+
+  /** 加载完整上下文：summary + transcript */
+  async loadAll(): Promise<Message[]> {
+    const messages = await this.loadTranscript()
+
+    // 如果没有历史记录，返回空
+    if (messages.length === 0) return []
+
+    // 确保 system prompt 在最前面
+    const hasSystem = messages.some(m => m.role === 'system')
+    if (!hasSystem) {
+      messages.unshift({ role: 'system', content: buildSystemPrompt() })
+    }
+
+    return messages
+  }
+
+  /** 清除所有记忆 */
+  async clear(): Promise<void> {
+    mkdirSync(MEMORY_DIR, { recursive: true })
+    await Bun.write(this.transcriptPath, '')
+    await Bun.write(this.summaryPath, '')
+  }
+}
+
+// ============================================
 // REPL
 // ============================================
 
@@ -416,21 +668,72 @@ async function main() {
   console.log('📝 使用模型: glm-4-flash')
   console.log('🔑 API Key: ' + (GLM_API_KEY ? '已配置 ✓' : '未配置 ❌'))
 
-  const messages: Message[] = [
-    { role: 'system', content: buildSystemPrompt() }
-  ]
+  // 初始化 Memory Manager（Claude Code 三层方案）
+  const memory = new MemoryManager({
+    transcriptPath: TRANSCRIPT_FILE,
+    summaryPath: SUMMARY_FILE,
+    compactionThreshold: COMPACTION_THRESHOLD,
+    keepRecent: KEEP_RECENT,
+  })
+
+  // 从 JSONL 加载历史消息
+  const savedMessages = await memory.loadAll()
+  const messages: Message[] = savedMessages.length > 0
+    ? savedMessages
+    : [{ role: 'system', content: buildSystemPrompt() }]
+
+  if (savedMessages.length > 0) {
+    console.log(`📂 已加载 ${savedMessages.length} 条历史消息`)
+  }
 
   while (true) {
     const userInput = await readUserInput()
-    if (userInput === '退出') break
+
+    // 特殊命令：清除记忆
+    if (userInput === '清除记忆') {
+      await memory.clear()
+      messages.length = 0
+      messages.push({ role: 'system', content: buildSystemPrompt() })
+      console.log('🗑️ 记忆已清除')
+      continue
+    }
+
+    // 特殊命令：手动压缩
+    if (userInput === '压缩') {
+      const compacted = await memory.compactIfNeeded(messages)
+      messages.length = 0
+      messages.push(...compacted)
+      console.log(`📦 压缩完成，当前 ${messages.length} 条消息`)
+      continue
+    }
+
+    if (userInput === '退出') {
+      console.log('💾 对话已保存，下次启动可继续')
+      break
+    }
+
+    // 追加用户消息（实时写入 JSONL）
+    memory.append({ role: 'user', content: userInput })
 
     for await (const event of agentLoop(messages, userInput)) {
       switch (event.type) {
         case 'tool_result':
           console.log(`📥 工具结果: ${JSON.stringify(event.data)}`)
+          // 实时追加 assistant 消息 + tool_result
           break
         case 'completed':
           console.log(`\n🎯 最终回答: ${event.data}`)
+          // 追加 assistant 回答
+          const lastMsg = messages[messages.length - 1]
+          if (lastMsg?.role === 'assistant') {
+            memory.append(lastMsg)
+          }
+          // 检查是否需要压缩
+          const compacted = await memory.compactIfNeeded(messages)
+          if (compacted.length !== messages.length) {
+            messages.length = 0
+            messages.push(...compacted)
+          }
           break
         case 'max_iterations':
           console.log(`⚠️ ${event.data}`)
