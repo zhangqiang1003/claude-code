@@ -8,6 +8,7 @@
  * - Tool Calling 循环（子 Agent 可调用工具获取实时信息）
  * - 错误隔离（单个 Agent 失败不影响整体）
  * - 流式整合输出
+ * - Human-in-the-Loop 权限系统（工具执行前用户确认 + 规则持久化 + 权限模式）
  *
  * 关键概念（对应 Claude Code 源码）：
  * - 动态路由 = subagent_type 参数 + whenToUse 描述（AgentTool.tsx）
@@ -15,6 +16,8 @@
  * - Tool Calling = tools 白名单/黑名单机制（agentToolUtils.ts）
  * - 错误隔离 = 独立 try/finally（runAgent.ts）
  * - 上下文优化 = 按角色过滤上下文（runAgent.ts 的 omitClaudeMd）
+ * - 权限系统 = allow/deny/ask 三元决策 + 规则模式匹配 + 管道（permissions.ts）
+ * - 权限模式 = default/bypass/dontAsk 三种模式改变管道行为
  *
  * 运行方式：
  * 1. 设置环境变量： export GLM_API_KEY="your-api-key"
@@ -206,9 +209,300 @@ interface AgentResult {
 	toolCallsCount: number    // 本次调用中工具被使用的次数
 }
 
+// ==========================
+// Human-in-the-Loop 权限系统
+// 参考 Claude Code 的 permissions 模块
+//
+// 架构：Rule 匹配 → Mode 转换 → 用户交互
+//   1. matchRules()   — 规则模式匹配（deny 优先 → ask → allow）
+//   2. checkPermission() — 权限管道（bypass 短路 → 规则 → 模式转换）
+//   3. promptPermission() — 终端交互（Allow/Always Allow/Deny/Always Deny）
+// ==========================
+
+// 权限决策：三元组 — 参考 Claude Code 的 PermissionBehavior
+type PermissionDecision = 'allow' | 'deny' | 'ask'
+
+// 权限模式 — 参考 Claude Code 的 PermissionMode
+// - default:  正常管道，未知工具 ask
+// - bypass:   跳过所有检查（= --dangerously-skip-permissions）
+// - dontAsk:  ask 自动变 deny（批处理/无人值守）
+type PermissionMode = 'default' | 'bypass' | 'dontAsk'
+
+// 权限规则 — 参考 Claude Code 的 .claude/settings.json
+interface PermissionRule {
+	toolPattern: string        // 工具名模式：精确匹配 'get_weather' 或通配符 '*'
+	decision: PermissionDecision
+	source: 'config' | 'session' | 'default'
+}
+
+// 会话级规则存储（模拟 Claude Code 的 settings.json 持久化）
+// 会话期间 Always Allow/Deny 的规则存在这里
+const sessionRules: PermissionRule[] = []
+
+// 当前权限模式
+let permissionMode: PermissionMode = 'default'
+
+/**
+ * 模式匹配 — 参考 Claude Code 的 pattern matching
+ * 支持：精确匹配 'get_weather' 和通配符 '*'
+ *
+ * Claude Code 还支持 Bash(rm *) 这种 参数通配符，
+ * 这里简化为工具名级别匹配（教学目的）
+ */
+function matchPattern(toolName: string, pattern: string): boolean {
+	if (pattern === '*') return true
+	return toolName === pattern
+}
+
+/**
+ * 规则匹配引擎 — deny 优先原则
+ * 参考 Claude Code 的 checkPermissions() 流程
+ *
+ * 检查顺序：deny 规则 → ask 规则 → allow 规则 → 默认 ask
+ * deny 永远最高优先级（安全第一）
+ */
+function matchRules(toolName: string, rules: PermissionRule[]): PermissionDecision {
+	// 第 1 轮：查 deny 规则（最高优先级）
+	for (const rule of rules) {
+		if (rule.decision === 'deny' && matchPattern(toolName, rule.toolPattern)) {
+			return 'deny'
+		}
+	}
+	// 第 2 轮：查 ask 规则
+	for (const rule of rules) {
+		if (rule.decision === 'ask' && matchPattern(toolName, rule.toolPattern)) {
+			return 'ask'
+		}
+	}
+	// 第 3 轮：查 allow 规则
+	for (const rule of rules) {
+		if (rule.decision === 'allow' && matchPattern(toolName, rule.toolPattern)) {
+			return 'allow'
+		}
+	}
+	// 兜底：未知工具默认 ask（安全第一）
+	return 'ask'
+}
+
+/**
+ * 权限检查管道 — 完整的 check 流程
+ * 参考 Claude Code 的 permission pipeline
+ *
+ * 流程：bypass 短路 → 规则匹配 → 模式转换 → 返回最终决策
+ *
+ * @param toolName 工具名称
+ * @returns 最终决策：allow / deny / ask
+ */
+function checkPermission(toolName: string): PermissionDecision {
+	// 短路 1：bypass 模式直接放行（跳过所有规则！）
+	// 这就是 --dangerously-skip-permissions 的效果
+	if (permissionMode === 'bypass') return 'allow'
+
+	// 正常管道：先查规则
+	const ruleResult = matchRules(toolName, sessionRules)
+
+	// 短路 2：dontAsk 模式将 ask 转为 deny
+	if (permissionMode === 'dontAsk' && ruleResult === 'ask') return 'deny'
+
+	return ruleResult
+}
+
+/**
+ * 终端交互式权限提示
+ * 参考 Claude Code REPL 的 PermissionPrompt 组件
+ *
+ * 用户选项（映射 Claude Code 的 4 个按钮）：
+ * - [1] Allow        → 本次放行
+ * - [2] Always Allow → 放行 + 生成规则（存入 sessionRules）
+ * - [3] Deny         → 本次拒绝
+ * - [4] Always Deny  → 拒绝 + 生成规则
+ *
+ * @returns 'allow' | 'deny'
+ */
+async function promptPermission(toolName: string, args: any): Promise<'allow' | 'deny'> {
+	console.log(`\n  🔒 权限请求: 工具 [${toolName}] 想要执行`)
+	console.log(`     参数: ${JSON.stringify(args)}`)
+	console.log(`  ─────────────────────────────`)
+	console.log(`    [1] ✅ Allow         (本次放行)`)
+	console.log(`    [2] ✅ Always Allow  (永久放行)`)
+	console.log(`    [3] ❌ Deny          (本次拒绝)`)
+	console.log(`    [4] ❌ Always Deny   (永久拒绝)`)
+	console.log(`  ─────────────────────────────`)
+
+	const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+	const answer = await new Promise<string>(resolve => {
+		rl.question('  你的选择 [1-4]: ', a => { rl.close(); resolve(a.trim()) })
+	})
+
+	switch (answer) {
+		case '2': {
+			// Always Allow → 持久化规则到会话
+			sessionRules.push({ toolPattern: toolName, decision: 'allow', source: 'session' })
+			console.log(`  📌 已记住: ${toolName} → Always Allow`)
+			return 'allow'
+		}
+		case '3':
+			console.log(`  🚫 已拒绝: ${toolName}`)
+			return 'deny'
+		case '4': {
+			// Always Deny → 持久化规则到会话
+			sessionRules.push({ toolPattern: toolName, decision: 'deny', source: 'session' })
+			console.log(`  📌 已记住: ${toolName} → Always Deny`)
+			return 'deny'
+		}
+		default: // [1] Allow
+			return 'allow'
+	}
+}
+
+/**
+ * 显示当前权限状态（/perm 命令调用）
+ */
+function showPermissionStatus(): void {
+	console.log('\n📋 权限系统状态')
+	console.log('─'.repeat(30))
+	console.log(`  模式: ${permissionMode}`)
+	console.log(`  规则数: ${sessionRules.length}`)
+	if (sessionRules.length > 0) {
+		for (const rule of sessionRules) {
+			const icon = rule.decision === 'allow' ? '✅' : rule.decision === 'deny' ? '🚫' : '❓'
+			console.log(`    ${icon} ${rule.toolPattern} → ${rule.decision} (${rule.source})`)
+		}
+	}
+	console.log('─'.repeat(30))
+}
+
 
 // ==========================
-// 第二步：定义三个专家 agent + 工具
+// Context Window 管理 & Compaction
+// 参考 Claude Code 的 services/compact/ 模块
+//
+// 架构（简化版 2 层管道）：
+//   Layer 1: Token 追踪 — 每轮读取 API usage 数据
+//   Layer 2: Autocompact — 超过阈值时调 LLM 生成摘要，替换旧消息
+//
+// Claude Code 实际有 4 层（Microcompact → SessionMemory → Autocompact → Reactive），
+// 这里简化为 2 层做教学演示。
+// ==========================
+
+const MAX_CONTEXT_TOKENS = 128000  // 模型的 context window 上限
+const COMPACT_THRESHOLD = 0.8      // 80% 时触发压缩
+const KEEP_RECENT_ROUNDS = 3       // 压缩时保留最近 N 轮（含 system + user）
+// 摘要输出上限（compactMessages 内部通过 callLLM 的 prompt 控制）
+
+/**
+ * 判断是否需要压缩
+ * 参考 Claude Code 的 shouldAutoCompact() — 阈值 = 有效窗口 - buffer
+ */
+function shouldCompact(usageTokens: number): boolean {
+	return usageTokens > MAX_CONTEXT_TOKENS * COMPACT_THRESHOLD
+}
+
+/**
+ * 估算消息数组的 token 数（粗略）
+ * 参考 Claude Code 的 roughTokenCountEstimation()
+ * 实际生产中应该用 API 返回的 usage 数据，这里作为 fallback
+ */
+function estimateTokens(messages: any[]): number {
+	let total = 0
+	for (const msg of messages) {
+		if (typeof msg.content === 'string') {
+			// 粗估：1 个中文字符 ≈ 2 tokens，1 个英文单词 ≈ 1.3 tokens
+			total += Math.ceil(msg.content.length * 1.5)
+		}
+		// tool_calls 的 arguments 也算
+		if (msg.tool_calls) {
+			for (const tc of msg.tool_calls) {
+				total += Math.ceil(JSON.stringify(tc).length * 1.5)
+			}
+		}
+	}
+	return total
+}
+
+/**
+ * 核心压缩函数 — 用 LLM 摘要替换旧消息
+ * 参考 Claude Code 的 compactConversation()
+ *
+ * 策略：
+ * 1. 保留前 2 条消息（system prompt + 用户原始请求）
+ * 2. 保留最近 KEEP_RECENT_ROUNDS 条消息（当前上下文）
+ * 3. 中间的旧消息 → 调 LLM 生成摘要 → 替换为一条 summary 消息
+ *
+ * @param messages 当前消息数组
+ * @param usageTokens API 返回的精确 token 数（可选）
+ * @returns 压缩后的消息数组
+ */
+async function compactMessages(messages: any[], usageTokens?: number): Promise<any[]> {
+	const currentTokens = usageTokens ?? estimateTokens(messages)
+	console.log(`\n  🗜️ [Compaction] 开始压缩...`)
+	console.log(`     当前: ${currentTokens} tokens / ${messages.length} 条消息`)
+
+	// 至少需要 4 条消息才有意义压缩（system + user + 至少 1 轮 + 最近几条）
+	if (messages.length < 4 + KEEP_RECENT_ROUNDS) {
+		console.log(`     消息太少，跳过压缩`)
+		return messages
+	}
+
+	// 优先级分层 — 参考 Claude Code 的 priority-based retention
+	const systemAndFirstUser = messages.slice(0, 2)           // system + 用户原始请求（永不压缩）
+	const recentMessages = messages.slice(-KEEP_RECENT_ROUNDS) // 最近 N 轮（保留原样）
+	const oldMessages = messages.slice(2, -KEEP_RECENT_ROUNDS) // 中间的旧消息（要压缩）
+
+	if (oldMessages.length === 0) {
+		console.log(`     没有旧消息需要压缩`)
+		return messages
+	}
+
+	console.log(`     保留: 前 2 条 + 最近 ${KEEP_RECENT_ROUNDS} 条`)
+	console.log(`     压缩: 中间 ${oldMessages.length} 条 → LLM 摘要`)
+
+	// 构建摘要 prompt — 参考 Claude Code 的 getCompactPrompt()
+	const summaryPrompt = `请将以下对话历史压缩成一段简洁的摘要。
+
+要求：
+1. 保留所有关键决策和结论
+2. 保留用户的具体需求和偏好
+3. 保留工具调用的重要结果（如查询到的数据）
+4. 丢弃无关紧要的细节（如问候语、重复信息）
+5. 用中文输出，不超过 500 字
+
+对话历史：
+---
+${oldMessages.map(m => {
+	if (typeof m.content === 'string') return `[${m.role}]: ${m.content.slice(0, 500)}`
+	if (m.tool_calls) return `[assistant tool_calls]: ${JSON.stringify(m.tool_calls).slice(0, 300)}`
+	return `[${m.role}]: (工具结果)`
+}).join('\n')}
+---`
+
+	// 调用 LLM 生成摘要
+	const summary = await callLLM([
+		{ role: 'system', content: '你是一个对话摘要助手。请将对话历史压缩成简洁的摘要，保留所有关键信息。' },
+		{ role: 'user', content: summaryPrompt },
+	])
+
+	console.log(`     ✅ 摘要生成完成 (${summary.length} 字符)`)
+
+	// 组装压缩后的消息数组
+	const compacted = [
+		...systemAndFirstUser,
+		// 摘要消息 — 替代被压缩的旧消息
+		{ role: 'user', content: `[对话摘要] 以下是之前对话的摘要：\n${summary}` },
+		{ role: 'assistant', content: '收到，我已了解之前的对话内容。请问还有什么需要帮助的？' },
+		...recentMessages,
+	]
+
+	const newEstimate = estimateTokens(compacted)
+	console.log(`     压缩后: ~${newEstimate} tokens / ${compacted.length} 条消息`)
+	console.log(`     节省: ~${currentTokens - newEstimate} tokens`)
+
+	return compacted
+}
+
+
+// ==========================
+// 定义三个专家 agent + 工具
 // 参考 Claude Code 的 tools 白名单/黑名单机制
 // ==========================
 
@@ -410,6 +704,21 @@ async function agentCall(agent: AgentDefinition, task: string): Promise<AgentRes
 		const choice = data.choices[0]
 		const assistantMsg = choice.message
 
+		// === Token 用量追踪 — 参考 Claude Code 的 tokenCountWithEstimation() ===
+		if (data.usage) {
+			const used = data.usage.prompt_tokens as number
+			const pct = Math.round((used / MAX_CONTEXT_TOKENS) * 100)
+			console.log(`    📊 Token: ${used}/${MAX_CONTEXT_TOKENS} (${pct}%)`)
+
+			// === Autocompact 触发 — 超过阈值时压缩 ===
+			if (shouldCompact(used)) {
+				console.log(`    ⚠️ 接近上下文上限 (${pct}%)，触发自动压缩...`)
+				const compacted = await compactMessages(messages, used)
+				messages.length = 0           // 清空原数组
+				messages.push(...compacted)    // 替换为压缩后的消息
+			}
+		}
+
 		// 没有工具调用 → LLM 直接给了最终回复
 		if (!assistantMsg.tool_calls || assistantMsg.tool_calls.length === 0) {
 			const elapsed = Date.now() - startTime
@@ -417,7 +726,7 @@ async function agentCall(agent: AgentDefinition, task: string): Promise<AgentRes
 			return { agentName: agent.name, content: assistantMsg.content || '（无响应）', toolCallsCount: totalToolCalls }
 		}
 
-		// 有工具调用 → 执行工具 → 结果喂回
+		// 有工具调用 → 权限检查 → 执行工具 → 结果喂回
 		messages.push(assistantMsg) // 保留 assistant 的 tool_call 消息
 		for (const toolCall of assistantMsg.tool_calls) {
 			const tool = agent.tools!.find(t => t.name === toolCall.function.name)
@@ -428,6 +737,28 @@ async function agentCall(agent: AgentDefinition, task: string): Promise<AgentRes
 
 			totalToolCalls++
 			const args = JSON.parse(toolCall.function.arguments)
+
+			// === Human-in-the-Loop 权限检查 ===
+			// 参考 Claude Code：工具执行前先走权限管道
+			const decision = checkPermission(tool.name)
+
+			if (decision === 'deny') {
+				// 直接拒绝 — 告诉 LLM 工具被拒绝
+				console.log(`  🚫 [权限] ${tool.name} 被规则拒绝`)
+				messages.push({ role: 'tool', tool_call_id: toolCall.id, content: `[权限拒绝] 工具 ${tool.name} 被用户配置的安全规则拒绝执行。请不使用此工具继续回答。` })
+				continue
+			}
+
+			if (decision === 'ask') {
+				// 需要用户确认 — await 暂停 Agentic Loop
+				const userChoice = await promptPermission(tool.name, args)
+				if (userChoice === 'deny') {
+					messages.push({ role: 'tool', tool_call_id: toolCall.id, content: `[权限拒绝] 用户拒绝了工具 ${tool.name} 的执行。请不使用此工具继续回答。` })
+					continue
+				}
+			}
+			// decision === 'allow' → 直接执行，无需交互
+
 			const toolResult = await tool.execute(args)
 			messages.push({ role: 'tool', tool_call_id: toolCall.id, content: toolResult })
 		}
@@ -595,11 +926,14 @@ function readUserInput(): Promise<string> {
 }
 
 async function main() {
-	console.log('=== Multi-Agent 旅行规划系统 ===')
+	console.log('=== Multi-Agent 旅行规划系统 (含权限 + Compaction) ===')
 	console.log('='.repeat(40))
 	console.log(`📝 模型: ${MODEL}`)
+	console.log(`🔐 权限模式: ${permissionMode}`)
+	console.log(`📏 Context Window: ${MAX_CONTEXT_TOKENS} tokens`)
 	console.log('🔑 API Key: ' + (GLM_API_KEY ? '已配置 ✓' : '未配置 ❌'))
-	console.log('输入你的旅行需求（输入 "退出" 结束）\n')
+	console.log('输入你的旅行需求（输入 "退出" 结束）')
+	console.log('命令: /perm 权限状态 | /mode 切换模式 | /compact 手动压缩\n')
 
 	while (true) {
 		const userInput = await readUserInput()
@@ -608,6 +942,56 @@ async function main() {
 		if (userInput === '退出') {
 			console.log('👋 再见！')
 			break
+		}
+
+		// === 权限系统命令 ===
+		if (userInput === '/perm') {
+			showPermissionStatus()
+			continue
+		}
+
+		if (userInput.startsWith('/mode')) {
+			const modeArg = userInput.split(' ')[1]
+			if (modeArg === 'default' || modeArg === 'bypass' || modeArg === 'dontAsk') {
+				permissionMode = modeArg
+				console.log(`🔐 权限模式已切换为: ${permissionMode}`)
+			} else {
+				console.log('用法: /mode <default|bypass|dontAsk>')
+				console.log('  default  — 正常模式，未知工具需用户确认')
+				console.log('  bypass   — 跳过所有权限检查（慎用！）')
+				console.log('  dontAsk  — 自动拒绝未授权的工具调用')
+			}
+			continue
+		}
+
+		// === Compaction 演示命令 ===
+		if (userInput === '/compact') {
+			console.log('\n🗜️ Compaction 系统说明')
+			console.log('─'.repeat(30))
+			console.log(`  Context Window: ${MAX_CONTEXT_TOKENS} tokens`)
+			console.log(`  压缩阈值: ${COMPACT_THRESHOLD * 100}% (${Math.round(MAX_CONTEXT_TOKENS * COMPACT_THRESHOLD)} tokens)`)
+			console.log(`  保留最近: ${KEEP_RECENT_ROUNDS} 轮消息`)
+			console.log(`  压缩策略: 旧消息 → LLM 摘要替换`)
+			console.log('')
+			console.log('  触发方式:')
+			console.log('    自动 — agentCall() 中 token 超过阈值时自动触发')
+			console.log('    /compact — 本命令（展示压缩能力演示）')
+			// 演示：构建模拟消息并压缩
+			console.log('')
+			console.log('  📋 演示：模拟 20 条消息的压缩过程...')
+			const demoMessages: any[] = [
+				{ role: 'system', content: '你是一个旅行助手' },
+				{ role: 'user', content: '帮我规划北京三日游' },
+			]
+			for (let i = 1; i <= 9; i++) {
+				demoMessages.push({ role: 'assistant', content: `第${i}轮：这是模拟的助手回复内容，包含景点推荐和路线规划...` })
+				demoMessages.push({ role: 'user', content: `第${i}轮：用户的追问或反馈...` })
+			}
+			const compacted = await compactMessages(demoMessages)
+			console.log(`  压缩前: ${demoMessages.length} 条消息`)
+			console.log(`  压缩后: ${compacted.length} 条消息`)
+			console.log('─'.repeat(30))
+			continue
 		}
 
 		await orchestrate(userInput)

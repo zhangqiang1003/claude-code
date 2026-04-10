@@ -11,7 +11,11 @@
       "Bash(bunx tsc --noEmit --skipLibCheck learn-examples/04-multi-agent.ts --types bun --moduleResolution bundler --module ESNext --target ESNext --esModuleInterop)",
       "Bash(bun install)",
       "Bash(bun add -d bun-types)",
-      "Bash(bun run learn-examples/04-multi-agent.ts)"
+      "Bash(bun run learn-examples/04-multi-agent.ts)",
+      "Bash(printf '/mode\\\\n/mode bypass\\\\n/perm\\\\n退出\\\\n')",
+      "Bash(printf '/mode bypass\\\\n北京三日游\\\\n退出\\\\n')",
+      "Bash(bun build learn-examples/04-multi-agent.ts --outdir /tmp/test-build)",
+      "Bash(bun build learn-examples/04-multi-agent.ts --target=bun --outdir /tmp/test-build)"
     ],
     "additionalDirectories": [
       "e:\\code\\claude-code\\.claude\\skills\\teach-me\\records"
