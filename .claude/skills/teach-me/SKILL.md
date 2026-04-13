@@ -102,7 +102,7 @@ options:
 
 ### Step 2: Build Concept List
 
-Decompose topic into 5-15 atomic concepts, ordered by dependency. Save to `session.md`:
+Decompose topic into 5-15 atomic concepts, ordered by dependency. Group concepts into logical clusters when they share strong dependencies. Save to `session.md`:
 
 ```markdown
 # Session: {topic}
@@ -110,14 +110,30 @@ Decompose topic into 5-15 atomic concepts, ordered by dependency. Save to `sessi
 - Started: {timestamp}
 
 ## Concepts
+### Group: Core Loop
 1. ✅ Functions as first-class objects (mastered)
 2. 🔵 Higher-order functions (in progress)
 3. ⬜ Closures
-4. ⬜ Decorator basics
+
+### Group: State & Memory
+4. ⬜ Context management
+5. ⬜ Memory persistence
+
+### Group: Security & Reliability
+6. ⬜ Permission systems
+7. ⬜ Error handling
 ...
 
 ## Misconceptions
 - [concept]: "{what learner said}" → likely root cause: {analysis}
+
+## Learner Questions
+- [概念 X]: "你提问的具体内容" — answered / follow-up needed
+- [概念 Y]: "另一个问题" — answered / follow-up needed
+
+## Spaced Review
+- [concept X]: due 2026-04-20
+- [concept Y]: due 2026-04-25
 
 ## Log
 - [timestamp] Diagnosed: intermediate
@@ -125,9 +141,11 @@ Decompose topic into 5-15 atomic concepts, ordered by dependency. Save to `sessi
 - [timestamp] Concept 2: started
 ```
 
-Use simple status: ✅ mastered | 🔵 in progress | ⬜ not started | ❌ needs review
+**Group naming**: Use 2-4 word group labels that reflect the architectural concern (e.g., "Core Loop", "State & Memory", "Security & Permissions", "Tooling & Integration").
 
-Present the concept list to the learner as a brief text outline so they see the path ahead.
+**Status legend**: ✅ mastered | 🔵 in progress | ⬜ not started | ❌ needs review
+
+Present the concept list grouped, so the learner sees both the path and the structure of the learning journey.
 
 ### Step 3: Tutor Loop
 
@@ -163,6 +181,11 @@ ALL questions use AskUserQuestion. Design options that probe understanding — i
 - Include "I'm not sure" or "Let me think about it" as a safe option
 - Use descriptions to add hints or context to each option
 
+**For multi-select questions (multiSelect: true)**:
+- Add a brief strategy hint at the start: "Tip: First eliminate the clearly wrong options, then decide on the rest."
+- If the question asks for "which are true" or "which apply", include 1-2 clearly wrong options to make elimination effective.
+- Avoid more than 6 options total; beyond that, split into two separate questions.
+
 **Interleaving** (every 3-4 questions): Mix a previously mastered concept into the current question's options naturally. Don't announce it as review.
 
 Example (learning closures, already mastered higher-order functions):
@@ -189,7 +212,7 @@ options:
 | Correct but shallow | "Good. Can you explain *why*?" — as AskUserQuestion with why-options |
 | Partially correct | "On the right track with [part]." — follow up with a more targeted AskUserQuestion |
 | Incorrect | "Interesting. Let's step back." — simpler AskUserQuestion to re-anchor |
-| "I don't know" / "Not sure" | "That's fine." — give a concrete example, then ask via AskUserQuestion with simpler options |
+| "I don't know" / "Not sure" | Distinguish two sub-types:<br>• **"Forgot"** (recognizes the concept but can't recall): Give a quick 1-sentence hint to jog memory, then re-ask the same question.<br>• **"Never understood"** (never internalized it): Give a concrete example, then ask via AskUserQuestion with simpler options.<br>Use tone and context to infer which subtype applies. If unsure, ask: "Does this ring any bells or is it completely new?" |
 
 **Hint escalation**: rephrase → simpler question → concrete example → point to principle → walk through minimal example together.
 
@@ -227,13 +250,27 @@ After 3-5 question rounds, assess qualitatively. The learner demonstrates master
 - Distinguish it from similar concepts
 - Find errors in incorrect usage
 
-If not ready: identify the specific gap and cycle back with targeted questions.
+To prompt teach-back effectively, use this scaffold (present as AskUserQuestion with a free-form "Other" option):
+
+```
+header: "Teach back"
+question: "A colleague asks you: 'What is [concept] and when would you use it?' How would you explain it?"
+multiSelect: false
+options:
+  - label: "[Accurate, concise explanation — likely mastered]"
+  - label: "[Roughly correct but missing key nuance — probe deeper]"
+  - label: "[Mixes with a related concept — misconception to address]"
+  - label: "[I can't explain it clearly yet]"
+    description: "Use 'Other' to attempt it, even if imperfect"
+```
+
+If teach-back is weak: identify the specific gap and cycle back with targeted questions before advancing.
 
 #### 3f. Practice Phase
 
-Before marking mastered, give a small hands-on task via AskUserQuestion. Present the task as a code/output prediction or scenario choice:
+Before marking mastered, give a small hands-on task via AskUserQuestion. Choose the format that best fits the concept's nature:
 
-- **Programming**: Show a small code snippet and ask what it outputs or which fix is correct:
+**For concrete/programmatic concepts** (decorators, algorithms, syntax patterns):
 ```
 header: "Practice"
 question: "Here's a buggy decorator. What's wrong with it?"
@@ -248,18 +285,41 @@ options:
   - label: "I'd like to try writing one from scratch"
     description: "Use 'Other' to write your own code"
 ```
-- **Non-programming**: Ask to identify which scenario best applies the concept:
+
+**For architectural/systemic concepts** (Multi-Agent, Compaction pipelines, permission flows):
 ```
-header: "Apply it"
-question: "Which real-world scenario best demonstrates [concept]?"
+header: "Scenario"
+question: "You're building an agent system. Which task would you delegate to a Worker agent rather than the Orchestrator?"
 multiSelect: false
 options:
-  - label: "[scenario A]"
-  - label: "[scenario B]"
-  - label: "[scenario C]"
-  - label: "I have my own example"
-    description: "Use 'Other' to share your own"
+  - label: "Coordinating multiple sub-tasks in sequence"
+    description: "Orchestrator should stay in control of orchestration logic"
+  - label: "Running an independent tool call (e.g., file search)"
+    description: "Workers excel at single, focused operations"
+  - label: "Deciding which agent to call next"
+    description: "That's the Orchestrator's job — routing decisions"
+  - label: "Merging results from multiple agents"
+    description: "The Orchestrator collects and synthesizes worker outputs"
 ```
+
+**For design/decision concepts** (trade-offs, architectural choices):
+```
+header: "Decide"
+question: "Your context is at 90% capacity. Which compaction strategy should trigger first?"
+multiSelect: false
+options:
+  - label: "LLM-based summarization of all old messages"
+    description: "Most thorough but slowest — good for emergency relief"
+  - label: "Prune tool results from early rounds"
+    description: "Fast and safe — keeps the conversation structure intact"
+  - label: "Discard the oldest user messages entirely"
+    description: "Dangerous — loses critical context for user intent"
+  - label: "Wait and do nothing"
+    description: "Risky — next API call will likely hit prompt_too_long"
+```
+
+**For multi-select scenarios**: Add a strategy hint before the question:
+> "Tip: First eliminate the options that are clearly wrong, then evaluate the rest carefully."
 
 Keep it 2-5 minutes. Pass = mastered. Fail = diagnose gap, cycle back.
 
@@ -268,7 +328,14 @@ Keep it 2-5 minutes. Pass = mastered. Fail = diagnose gap, cycle back.
 Update `session.md` after each round:
 - Change concept status if applicable
 - Add new misconceptions or resolve existing ones
+- Add any questions the learner asked (see below)
 - Append to log
+
+**Capturing learner questions**: If the learner asks a spontaneous question (not in response to an AskUserQuestion), record it under `## Learner Questions`:
+- Questions that are answered immediately → mark as `answered`
+- Questions that reveal a deeper gap → mark as `follow-up needed` and address in a later round
+- Questions that are out of scope for the current concept → note `deferred to [concept Y]`
+- These questions are distinct from misconceptions — they signal active inquiry, not wrong thinking
 
 ### Step 4: Session End
 
@@ -290,17 +357,43 @@ Updated: {timestamp}
 - Recurring difficulty with: {area}
 
 ## Topics
-- Python decorators (8/10 concepts, 2025-01-15)
+- Python decorators (8/10 concepts, 2025-01-15, due 2025-01-22)
+- AI Agent development (12/12 concepts, 2026-04-10, due 2026-04-24)
+
+## Spaced Review
+- Review [concept X] in 10 days if not revisited
+- Review [concept Y] in 21 days if not revisited
 ```
 
-3. Give a brief text summary of what was covered, key insights, and areas for further study.
+3. Give a structured summary with three explicit blocks:
+
+```
+✅ 今日掌握
+  • [概念 X] — 理解了 [一句话核心]
+  • [概念 Y] — 实践完成 [做了什么]
+
+⚠️ 仍需巩固
+  • [概念 Z] — [还模糊的地方]，建议重刷该章节
+
+🎯 下一步预览
+  • [下一个概念] — [一句话介绍]
+  • 或者: 继续深入 [当前 Group] 的哪些方向
+```
+
+**Spaced repetition scheduling**: When marking a concept as mastered, schedule review dates in the session.md `## Spaced Review` section:
+- **7 days** after mastery (first re-exposure)
+- **21 days** after mastery (second re-exposure)
+- **60 days** after mastery (long-term retention)
+
+On `--resume`, if any scheduled review date has passed, add the concept to the quick-review queue before continuing new material.
 
 ## Resuming Sessions
 
 On `--resume`:
 
 1. Read `session.md` and `learner-profile.md`
-2. Quick check on 1-2 previously mastered concepts via AskUserQuestion:
+2. Check `## Learner Questions` for any `follow-up needed` items — address those before continuing new material
+3. Quick check on 1-2 previously mastered concepts via AskUserQuestion:
 ```
 header: "Quick review"
 question: "Last time you mastered [concept X]. Can you recall which of these is true about it?"

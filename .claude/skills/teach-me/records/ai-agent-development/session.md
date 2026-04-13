@@ -28,7 +28,7 @@
 - [x] 添加 System Prompt 模块化
 - [x] 添加 Token 预算监控
 - [x] 为 04-multi-agent.ts 添加完整权限系统（6 个概念）
-- [x] 为 04-multi-agent.ts 添加 Compaction 系统（Token 追踪 + 自动压缩 + /compact 命令）
+- [x] 为 04-multi-agent.ts 添加 Compaction 系统（Token 追踪 + 自动压缩 + /compact 命令，已升级为 4 层管道：Microcompact/SessionMemory/Autocompact/Reactive）
 
 ## Misconceptions
 
@@ -41,11 +41,30 @@
 
 1. **Agentic Loop 本质**：while(true) + needsFollowUp 信号
 2. **状态管理**：messages 数组是 LLM 的"记忆"，每次都要完整发送
-3. **Token 预算**：5 级压缩管道（Budget → Snip → Micro → Collapse → Auto）
+3. **Token 预算**：5 级触发分层（Budge → Snip → Micro → Collapse → Auto）+ 4 层操作分层；preservePriority：Plan > 近期 assistant > tool_result > 用户意图 > 其他；system prompt 不参与压缩
 4. **权限安全**：默认拒绝 + 沙箱隔离 + 规则引擎
 5. **Multi-Agent**：Orchestrator 分配任务 → Worker 执行 → 结果合并
 6. **HITL 权限系统**：三元决策（allow/deny/ask）+ deny 优先管道 + 模式转换 + await 暂停
-7. **Compaction**：渐进式 4 层管道（Microcompact → SessionMemory → Autocompact → Reactive），先轻后重，能省则省
+7. **Compaction**：渐进式 4 层管道（Microcompact → SessionMemory → Autocompact → Reactive），先轻后重，能省则省；demo 实现已升级为 4 层
+
+## Learner Questions
+
+- [bypass-immune 触发条件]："何时会触发 bypass-immune 保护？" — answered
+  - 核心：`.git/`、`.claude/`、NTFS ADS 可疑路径、危险文件 → `checkPathSafetyForAutoEdit` 返回 `safetyCheck` → 即使 bypass 模式也强制弹窗
+- [Compaction 4 层管道]："精讲 Compaction 的 4 层渐进管道" — answered
+  - 核心：Microcompact（tool_result 替换）→ SessionMemory（独立存储+边界摘要）→ Autocompact（LLM 摘要）→ Reactive（PTL 报错后最后一搏，stub）
+- [Token 预算 & 优先级保留]："Token 预算的 5 级 vs 4 层是什么关系？preservePriority 优先级顺序？" — answered
+  - 5 级 = 触发阈值的严重程度分层（Budget → Snip → Micro → Collapse → Auto）
+  - 4 层 = 压缩操作的分层（Microcompact → SessionMemory → Autocompact → Reactive）
+  - 两个维度不同，名字相似但用途不同
+  - preservePriority 顺序：Plan > 近期 assistant > tool_result > 用户意图 > 其他文本
+  - system prompt 不参与压缩（单独处理，每次必 prepend）
+- [Skill fork vs 内置子 agent]："Skill fork 的子 agent 和 Claude Code 内置子 agent（explore/plan/verification/teammates）是什么关系？" — answered
+  - 核心结论：**它们共享同一个 `runAgent()` 底层引擎，执行机制完全相同**
+  - Skill fork = 用 SKILL.md frontmatter 动态构建 agent 定义
+  - 内置子 agent = `agentDefinitions` 预定义的 agent 类型
+  - 共同基础设施：`createSubagentContext()` 隔离上下文 + `shouldAvoidPermissionPrompts: true` + 新 agentId/depth
+  - Skill fork 默认用 `general-purpose` agent，可通过 `agent:` 字段指定类型
 
 ## Next Steps（可选进阶）
 
@@ -70,3 +89,8 @@
 - [2026-04-09] 概念 10 完成：Memory 持久化（JSONL 追加写入 + Compaction 压缩 + 摘要，参考 Claude Code 三层方案）
 - [2026-04-10] 概念 11 完成：Human-in-the-Loop 权限系统（6 个子概念全部掌握 + 实践集成到 04-multi-agent.ts）
 - [2026-04-10] 概念 12 完成：Context Window 管理 & Compaction（Token 追踪 + 阈值触发 + LLM 摘要 + 优先级保留 + Claude Code 4 层管道分析）
+- [2026-04-13] 复习会话：bypass-immune 触发机制（safetyCheck 决策） + Compaction 4 层渐进管道（Microcompact → SessionMemory → Autocompact → Reactive）
+- [2026-04-13] 优化 04-multi-agent.ts Compaction 系统：新增 Microcompact（tool_result 替换占位符）和 SessionMemory（独立存储+compactBoundary）两层，实现完整 4 层渐进管道
+- [2026-04-13] 复习 Token 预算：澄清 5 级触发分层 vs 4 层操作分层的区别；掌握 preservePriority 顺序（Plan > 近期 assistant > tool_result > 用户意图 > 其他）；system prompt 不参与压缩
+- [2026-04-13] Skill 系统深度学习：Skill vs Tool 区别、目录结构、执行管道（inline/fork）、frontmatter 字段、Hooks 机制、Compaction 保护、teach-me 设计解析
+- [2026-04-13] Skill fork vs 内置子 agent 关系：两者共享 `runAgent()` 引擎，区别仅在于 agent 定义来源（动态 vs 预定义），共享 `createSubagentContext()` 隔离机制

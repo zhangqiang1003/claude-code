@@ -18,6 +18,7 @@
  * - 上下文优化 = 按角色过滤上下文（runAgent.ts 的 omitClaudeMd）
  * - 权限系统 = allow/deny/ask 三元决策 + 规则模式匹配 + 管道（permissions.ts）
  * - 权限模式 = default/bypass/dontAsk 三种模式改变管道行为
+ * - 4 层渐进压缩 = Microcompact（tool_result 替换占位符）→ SessionMemory（独立存储+边界摘要）→ Autocompact（LLM 语义摘要）→ Reactive（stub，等 PTL 报错触发）
  *
  * 运行方式：
  * 1. 设置环境变量： export GLM_API_KEY="your-api-key"
@@ -377,25 +378,283 @@ function showPermissionStatus(): void {
 // Context Window 管理 & Compaction
 // 参考 Claude Code 的 services/compact/ 模块
 //
-// 架构（简化版 2 层管道）：
-//   Layer 1: Token 追踪 — 每轮读取 API usage 数据
-//   Layer 2: Autocompact — 超过阈值时调 LLM 生成摘要，替换旧消息
+// 架构（4 层渐进管道）：
+//   Layer 1: Microcompact — 旧 tool_result 原地替换为占位符（零开销）
+//   Layer 2: SessionMemory — 关键信息提取到独立存储，插入 compactBoundary
+//   Layer 3: Autocompact — 超过阈值时调 LLM 生成语义摘要
+//   Layer 4: Reactive — stub（等 prompt_too_long 报错才触发）
 //
-// Claude Code 实际有 4 层（Microcompact → SessionMemory → Autocompact → Reactive），
-// 这里简化为 2 层做教学演示。
+// 设计原则：先轻后重，能省则省
 // ==========================
 
 const MAX_CONTEXT_TOKENS = 128000  // 模型的 context window 上限
-const COMPACT_THRESHOLD = 0.8      // 80% 时触发压缩
-const KEEP_RECENT_ROUNDS = 3       // 压缩时保留最近 N 轮（含 system + user）
-// 摘要输出上限（compactMessages 内部通过 callLLM 的 prompt 控制）
+const AUTOCOMPACT_THRESHOLD = 0.85 // 85% 时触发 Autocompact（LLM 摘要）
+const MICROCOMPACT_THRESHOLD = 0.65 // 65% 时触发 Microcompact（tool_result 替换）
+const SESSION_MEMORY_THRESHOLD = 0.75 // 75% 时触发 SessionMemory
+const KEEP_RECENT_ROUNDS = 3       // 压缩时保留最近 N 轮
+const COMPACT_MAX_OUTPUT_TOKENS = 5120 // 摘要最大 token 上限
+
+// ==========================
+// Layer 1: Microcompact
+// 将旧的 tool_result 内容替换为占位符，零 LLM 开销
+// 参考 Claude Code 的 TIME_BASED_MC_CLEARED_MESSAGE 机制
+// ==========================
+
+const TIME_BASED_MC_CLEARED_MESSAGE = '[Old tool result content cleared]'
+
+// 可以被 Microcompact 清理的工具（结果可以被安全替换）
+const COMPACTABLE_TOOLS = new Set([
+	'get_weather',
+	'get_ticket_info',
+	'web_search',
+	'web_fetch',
+	'file_read',
+	'glob',
+	'grep',
+])
+
+/**
+ * 判断工具结果是否可以被 Microcompact 清理
+ * 原则：可重复查询的结果可以清理（如天气、搜索）
+ *       必须保留的结果不能清理（如用户输入、敏感操作）
+ */
+function isToolCompactable(toolName: string): boolean {
+	return COMPACTABLE_TOOLS.has(toolName)
+}
+
+/**
+ * 估算单个 tool_result 的 token 数
+ */
+function estimateToolResultTokens(toolResultContent: string | any): number {
+	const content = typeof toolResultContent === 'string'
+		? toolResultContent
+		: JSON.stringify(toolResultContent)
+	// 粗估：1.5 tokens/字符
+	return Math.ceil(content.length * 1.5)
+}
+
+/**
+ * Layer 1: Microcompact — 遍历消息，将旧 tool_result 替换为占位符
+ *
+ * @param messages 消息数组（就地修改）
+ * @returns 清理掉的 token 数
+ */
+function runMicrocompact(messages: any[]): number {
+	let tokensFreed = 0
+	for (const msg of messages) {
+		// 只处理 user 消息中的 tool_result 块
+		if (msg.role !== 'user' || !Array.isArray(msg.content)) continue
+
+		for (const block of msg.content) {
+			if (block.type !== 'tool_result') continue
+
+			// 找到对应的 tool_use 工具名
+			// tool_result 的 tool_use_id 指向同数组中之前的 assistant tool_call
+			const toolUseId = block.tool_use_id
+			const toolName = findToolNameById(messages, toolUseId)
+
+			if (toolName && isToolCompactable(toolName)) {
+				const oldTokens = estimateToolResultTokens(block.content)
+				tokensFreed += oldTokens
+				block.content = TIME_BASED_MC_CLEARED_MESSAGE
+			}
+		}
+	}
+	return tokensFreed
+}
+
+/**
+ * 根据 tool_use_id 在消息数组中找到对应的工具名
+ */
+function findToolNameById(messages: any[], toolUseId: string): string | null {
+	for (const msg of messages) {
+		if (msg.role === 'assistant' && msg.tool_calls) {
+			for (const tc of msg.tool_calls) {
+				if (tc.id === toolUseId) {
+					return tc.function?.name || null
+				}
+			}
+		}
+	}
+	return null
+}
+
+// ==========================
+// Layer 2: SessionMemory
+// 将关键信息提取到独立存储，在消息中插入 compactBoundary
+// 参考 Claude Code 的 SessionMemory 机制
+// ==========================
+
+// 模拟独立存储（实际会写到文件系统）
+interface SessionMemoryStore {
+	extractedKeyInfo: string[]  // 提取的关键信息
+	lastSummary: string         // 上一次的摘要
+	preservedMessageCount: number // 保留的消息数
+}
+
+const sessionMemory: SessionMemoryStore = {
+	extractedKeyInfo: [],
+	lastSummary: '',
+	preservedMessageCount: 0,
+}
+
+/**
+ * 判断消息是否包含有价值的文本内容（应当保留）
+ * 兼容两种格式：LLM 返回的 {message: {content: [...]}} 和 demo 用的 {content: ...}
+ */
+function hasTextBlocks(msg: any): boolean {
+	const assistantContent = msg.message?.content ?? msg.content
+	const userContent = msg.content
+
+	if (msg.role === 'assistant') {
+		if (Array.isArray(assistantContent)) {
+			return assistantContent.some((b: any) => b.type === 'text' && b.text?.length > 50)
+		}
+		return typeof assistantContent === 'string' && assistantContent.length > 50
+	}
+	if (msg.role === 'user') {
+		if (typeof userContent === 'string') return userContent.length > 50
+		if (Array.isArray(userContent)) {
+			return userContent.some((b: any) => b.type === 'text' && b.text?.length > 50)
+		}
+	}
+	return false
+}
+
+/**
+ * Layer 2: SessionMemory — 提取关键信息，插入 compactBoundary
+ *
+ * @param messages 当前消息数组
+ * @param threshold 触发阈值（token 数）
+ * @returns { compacted: boolean, tokensFreed: number }
+ */
+async function runSessionMemoryCompact(
+	messages: any[],
+	threshold: number
+): Promise<{ compacted: boolean; tokensFreed: number }> {
+	const currentTokens = estimateTokens(messages)
+
+	// 必须超过阈值才触发
+	if (currentTokens < threshold) {
+		return { compacted: false, tokensFreed: 0 }
+	}
+
+	// 保留：system + 首个 user + 最近 3 条有文本的消息
+	const minTextBlockMessages = 5
+	const systemAndFirst = messages.slice(0, 2)
+	const recentWithText: any[] = []
+	const oldMessages: any[] = []
+
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (recentWithText.length >= minTextBlockMessages) {
+			oldMessages.unshift(messages[i])
+		} else {
+			if (hasTextBlocks(messages[i])) {
+				recentWithText.unshift(messages[i])
+			} else {
+				oldMessages.unshift(messages[i])
+			}
+		}
+	}
+
+	// 如果旧消息太少，不值得压缩
+	if (oldMessages.length < 3) {
+		return { compacted: false, tokensFreed: 0 }
+	}
+
+	// 提取关键信息
+	const keyInfo = oldMessages
+		.filter(m => m.role === 'user' && typeof m.content === 'string')
+		.slice(0, 5)
+		.map(m => m.content.slice(0, 200))
+	sessionMemory.extractedKeyInfo.push(...keyInfo)
+
+	// 计算可节省的 token
+	const tokensFreed = estimateTokens(oldMessages)
+
+	// 构建压缩后的消息
+	const summaryText = `[SessionMemory] 之前的对话已压缩。关键信息：${keyInfo.slice(0, 3).join('；')}`
+
+	const compactedMessages = [
+		...systemAndFirst,
+		// compactBoundary 消息
+		{
+			role: 'system',
+			content: `[Compaction Boundary] ${sessionMemory.lastSummary || '(首次压缩)'}`
+		},
+		// 摘要消息
+		{
+			role: 'user',
+			content: summaryText
+		},
+		{
+			role: 'assistant',
+			content: '收到，我已了解之前对话的关键信息。继续我们的讨论。'
+		},
+		...recentWithText,
+	]
+
+	sessionMemory.lastSummary = summaryText.slice(0, 500)
+	sessionMemory.preservedMessageCount = compactedMessages.length
+
+	// 替换消息数组
+	messages.length = 0
+	messages.push(...compactedMessages)
+
+	console.log(`  🗄️ [SessionMemory] 压缩完成: ${oldMessages.length} 条 → ${compactedMessages.length} 条，节省 ~${tokensFreed} tokens`)
+	return { compacted: true, tokensFreed }
+}
+
+// ==========================
+// Layer 3: Autocompact
+// LLM 语义摘要（重型手段）
+// ==========================
 
 /**
  * 判断是否需要压缩
- * 参考 Claude Code 的 shouldAutoCompact() — 阈值 = 有效窗口 - buffer
+ * 按层级检查：
+ *   1. Token < 65%阈值 → Microcompact 尝试清理
+ *   2. Token > 75%阈值 → SessionMemory
+ *   3. Token > 85%阈值 → Autocompact (LLM)
+ */
+async function checkAndCompact(messages: any[]): Promise<{ didCompact: boolean; layer: string }> {
+	const currentTokens = estimateTokens(messages)
+	const microThreshold = MAX_CONTEXT_TOKENS * MICROCOMPACT_THRESHOLD
+	const smThreshold = MAX_CONTEXT_TOKENS * SESSION_MEMORY_THRESHOLD
+	const autoThreshold = MAX_CONTEXT_TOKENS * AUTOCOMPACT_THRESHOLD
+
+	// Layer 1: Microcompact（总是尝试，零开销）
+	const microTokensFreed = runMicrocompact(messages)
+	if (microTokensFreed > 0) {
+		console.log(`  🧹 [Microcompact] 清理 tool_result，节省 ~${microTokensFreed} tokens`)
+	}
+
+	const afterMicro = estimateTokens(messages)
+
+	// Layer 2: SessionMemory
+	if (afterMicro > smThreshold) {
+		const result = await runSessionMemoryCompact(messages, smThreshold)
+		if (result.compacted) {
+			return { didCompact: true, layer: 'SessionMemory' }
+		}
+	}
+
+	// Layer 3: Autocompact (LLM)
+	if (afterMicro > autoThreshold) {
+		console.log(`  🗜️ [Autocompact] 触发 LLM 摘要压缩...`)
+		await compactMessages(messages)
+		return { didCompact: true, layer: 'Autocompact' }
+	}
+
+	return { didCompact: false, layer: 'none' }
+}
+
+/**
+ * @deprecated 请使用 checkAndCompact() 入口方法
+ * 保留此方法用于 /compact 命令演示
  */
 function shouldCompact(usageTokens: number): boolean {
-	return usageTokens > MAX_CONTEXT_TOKENS * COMPACT_THRESHOLD
+	return usageTokens > MAX_CONTEXT_TOKENS * AUTOCOMPACT_THRESHOLD
 }
 
 /**
@@ -421,27 +680,25 @@ function estimateTokens(messages: any[]): number {
 }
 
 /**
- * 核心压缩函数 — 用 LLM 摘要替换旧消息
+ * Layer 3: 核心压缩函数 — 用 LLM 摘要替换旧消息
  * 参考 Claude Code 的 compactConversation()
  *
- * 策略：
- * 1. 保留前 2 条消息（system prompt + 用户原始请求）
- * 2. 保留最近 KEEP_RECENT_ROUNDS 条消息（当前上下文）
+ * 策略（优先级保留）：
+ * 1. 保留 system prompt + 用户原始请求（前 2 条）
+ * 2. 保留最近有文本内容的消息（KEEP_RECENT_ROUNDS）
  * 3. 中间的旧消息 → 调 LLM 生成摘要 → 替换为一条 summary 消息
  *
- * @param messages 当前消息数组
- * @param usageTokens API 返回的精确 token 数（可选）
- * @returns 压缩后的消息数组
+ * @param messages 当前消息数组（就地修改）
  */
-async function compactMessages(messages: any[], usageTokens?: number): Promise<any[]> {
-	const currentTokens = usageTokens ?? estimateTokens(messages)
-	console.log(`\n  🗜️ [Compaction] 开始压缩...`)
+async function compactMessages(messages: any[]): Promise<void> {
+	const currentTokens = estimateTokens(messages)
+	console.log(`  🗜️ [Autocompact] 开始 LLM 摘要压缩...`)
 	console.log(`     当前: ${currentTokens} tokens / ${messages.length} 条消息`)
 
-	// 至少需要 4 条消息才有意义压缩（system + user + 至少 1 轮 + 最近几条）
+	// 至少需要 4 条消息才有意义压缩
 	if (messages.length < 4 + KEEP_RECENT_ROUNDS) {
 		console.log(`     消息太少，跳过压缩`)
-		return messages
+		return
 	}
 
 	// 优先级分层 — 参考 Claude Code 的 priority-based retention
@@ -451,7 +708,7 @@ async function compactMessages(messages: any[], usageTokens?: number): Promise<a
 
 	if (oldMessages.length === 0) {
 		console.log(`     没有旧消息需要压缩`)
-		return messages
+		return
 	}
 
 	console.log(`     保留: 前 2 条 + 最近 ${KEEP_RECENT_ROUNDS} 条`)
@@ -497,7 +754,9 @@ ${oldMessages.map(m => {
 	console.log(`     压缩后: ~${newEstimate} tokens / ${compacted.length} 条消息`)
 	console.log(`     节省: ~${currentTokens - newEstimate} tokens`)
 
-	return compacted
+	// 替换消息数组
+	messages.length = 0
+	messages.push(...compacted)
 }
 
 
@@ -704,18 +963,17 @@ async function agentCall(agent: AgentDefinition, task: string): Promise<AgentRes
 		const choice = data.choices[0]
 		const assistantMsg = choice.message
 
-		// === Token 用量追踪 — 参考 Claude Code 的 tokenCountWithEstimation() ===
+		// === Token 用量追踪 + 4 层渐进压缩 — 参考 Claude Code ===
 		if (data.usage) {
 			const used = data.usage.prompt_tokens as number
 			const pct = Math.round((used / MAX_CONTEXT_TOKENS) * 100)
 			console.log(`    📊 Token: ${used}/${MAX_CONTEXT_TOKENS} (${pct}%)`)
 
-			// === Autocompact 触发 — 超过阈值时压缩 ===
-			if (shouldCompact(used)) {
-				console.log(`    ⚠️ 接近上下文上限 (${pct}%)，触发自动压缩...`)
-				const compacted = await compactMessages(messages, used)
-				messages.length = 0           // 清空原数组
-				messages.push(...compacted)    // 替换为压缩后的消息
+			// === 渐进压缩管道检查 ===
+			// 按层级尝试：Microcompact → SessionMemory → Autocompact
+			const result = await checkAndCompact(messages)
+			if (result.didCompact) {
+				console.log(`    ✅ [${result.layer}] 压缩完成`)
 			}
 		}
 
@@ -966,30 +1224,64 @@ async function main() {
 
 		// === Compaction 演示命令 ===
 		if (userInput === '/compact') {
-			console.log('\n🗜️ Compaction 系统说明')
+			console.log('\n🗜️ Compaction 4 层渐进管道说明')
 			console.log('─'.repeat(30))
 			console.log(`  Context Window: ${MAX_CONTEXT_TOKENS} tokens`)
-			console.log(`  压缩阈值: ${COMPACT_THRESHOLD * 100}% (${Math.round(MAX_CONTEXT_TOKENS * COMPACT_THRESHOLD)} tokens)`)
-			console.log(`  保留最近: ${KEEP_RECENT_ROUNDS} 轮消息`)
-			console.log(`  压缩策略: 旧消息 → LLM 摘要替换`)
 			console.log('')
-			console.log('  触发方式:')
-			console.log('    自动 — agentCall() 中 token 超过阈值时自动触发')
-			console.log('    /compact — 本命令（展示压缩能力演示）')
-			// 演示：构建模拟消息并压缩
+			console.log('  触发阈值:')
+			console.log(`    Microcompact:   > ${MICROCOMPACT_THRESHOLD * 100}% (${Math.round(MAX_CONTEXT_TOKENS * MICROCOMPACT_THRESHOLD)} tokens)`)
+			console.log(`    SessionMemory:  > ${SESSION_MEMORY_THRESHOLD * 100}% (${Math.round(MAX_CONTEXT_TOKENS * SESSION_MEMORY_THRESHOLD)} tokens)`)
+			console.log(`    Autocompact:    > ${AUTOCOMPACT_THRESHOLD * 100}% (${Math.round(MAX_CONTEXT_TOKENS * AUTOCOMPACT_THRESHOLD)} tokens)`)
 			console.log('')
-			console.log('  📋 演示：模拟 20 条消息的压缩过程...')
+			console.log('  各层说明:')
+			console.log('    Layer 1: Microcompact   — tool_result 替换为占位符，零 LLM 开销')
+			console.log('    Layer 2: SessionMemory  — 关键信息提取 + compactBoundary，零 LLM 开销')
+			console.log('    Layer 3: Autocompact    — LLM 语义摘要，保留优先级')
+			console.log('    Layer 4: Reactive      — (stub) prompt_too_long 报错后触发')
+			console.log('')
+			console.log('  保留策略:')
+			console.log('    system + 首个 user 永久保留')
+			console.log('    最近 3 轮有文本的消息优先保留')
+			console.log('    工具结果按类型判断是否可清理')
+			console.log('')
+			console.log('  📋 演示：模拟 20 条消息的 4 层压缩过程...')
 			const demoMessages: any[] = [
 				{ role: 'system', content: '你是一个旅行助手' },
 				{ role: 'user', content: '帮我规划北京三日游' },
 			]
 			for (let i = 1; i <= 9; i++) {
-				demoMessages.push({ role: 'assistant', content: `第${i}轮：这是模拟的助手回复内容，包含景点推荐和路线规划...` })
-				demoMessages.push({ role: 'user', content: `第${i}轮：用户的追问或反馈...` })
+				demoMessages.push({
+					role: 'assistant',
+					content: `第${i}轮：这是模拟的助手回复内容，包含景点推荐和路线规划...`,
+					tool_calls: [{ id: `call_${i}`, function: { name: 'get_ticket_info', arguments: '{}' } }]
+				})
+				demoMessages.push({
+					role: 'user',
+					content: [
+						{ type: 'tool_result', tool_use_id: `call_${i}`, content: `第${i}轮工具返回的详细结果，包含大量数据...` },
+						{ type: 'text', text: `第${i}轮：用户的追问或反馈...` }
+					]
+				})
 			}
-			const compacted = await compactMessages(demoMessages)
-			console.log(`  压缩前: ${demoMessages.length} 条消息`)
-			console.log(`  压缩后: ${compacted.length} 条消息`)
+			const beforeTokens = estimateTokens(demoMessages)
+			console.log(`  压缩前: ${beforeTokens} tokens / ${demoMessages.length} 条消息`)
+
+			// 演示各层
+			console.log('')
+			console.log('  [Layer 1: Microcompact]')
+			const freed = runMicrocompact(demoMessages)
+			console.log(`    清理 tool_result: 节省 ~${freed} tokens`)
+
+			console.log('  [Layer 2: SessionMemory]')
+			await runSessionMemoryCompact(demoMessages, 0) // 强制触发
+
+			console.log('  [Layer 3: Autocompact]')
+			await compactMessages(demoMessages)
+
+			const afterTokens = estimateTokens(demoMessages)
+			console.log('')
+			console.log(`  压缩后: ${afterTokens} tokens / ${demoMessages.length} 条消息`)
+			console.log(`  总共节省: ~${beforeTokens - afterTokens} tokens (${Math.round((1 - afterTokens / beforeTokens) * 100)}%)`)
 			console.log('─'.repeat(30))
 			continue
 		}
