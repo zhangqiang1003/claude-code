@@ -94,3 +94,7 @@
 - [2026-04-13] 复习 Token 预算：澄清 5 级触发分层 vs 4 层操作分层的区别；掌握 preservePriority 顺序（Plan > 近期 assistant > tool_result > 用户意图 > 其他）；system prompt 不参与压缩
 - [2026-04-13] Skill 系统深度学习：Skill vs Tool 区别、目录结构、执行管道（inline/fork）、frontmatter 字段、Hooks 机制、Compaction 保护、teach-me 设计解析
 - [2026-04-13] Skill fork vs 内置子 agent 关系：两者共享 `runAgent()` 引擎，区别仅在于 agent 定义来源（动态 vs 预定义），共享 `createSubagentContext()` 隔离机制
+- [2026-04-14] 深度复习：Compaction 4层管道（Microcompact 单消息原地替换 vs SessionMemory 跨边界批量转移，已输出文档 08-compaction-4layer-deep-dive.md）
+- [2026-04-14] 深度复习：Skill fork 权限机制（shouldAvoidPermissionPrompts + allowed-tools 白名单双重控制）
+- [2026-04-14] 深度复习 Multi-Agent：runAgent() 统一入口、resolveAgentTools() 工具过滤、isAsync vs sync 权限行为差异
+- [2026-04-14] 验证通过：Microcompact/SessionMemory 区分、Skill fork 权限继承链路、Explore 同步权限机制

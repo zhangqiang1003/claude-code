@@ -1,6 +1,6 @@
 # Learner Profile
 
-- Updated: 2026-04-13
+- Updated: 2026-04-14
 
 ## Style
 
@@ -18,11 +18,17 @@
 
 - AI Agent development (12/12 concepts, 2026-04-10, due 2026-04-24)
 - Claude Code Skill 系统开发 (11/11 concepts, 2026-04-13, due 2026-04-27)
-- MCP (Model Context Protocol) — 1/6 concepts, 2026-04-13, in progress
+- MCP (Model Context Protocol) (6/6 concepts, 2026-04-14, due 2026-05-05)
+- Bridge / Remote (6/6 concepts, 2026-04-14, due 2026-05-05)
+- Skill Hooks 进阶 (3/9 concepts, 2026-04-14, due 2026-04-21)
 
 ## Spaced Review
 
 - [Agentic Loop / Tool Calling] — 2026-04-24
-- [Compaction 4 层管道] — 2026-04-20
+- [Compaction 4 层管道] — 2026-04-20 → 已复习，下次 2026-04-27
 - [权限系统 6 子概念] — 2026-04-20
-- [Skill fork vs 内置子 agent] — 2026-04-27
+- [Skill fork vs 内置子 agent] — 2026-04-27 → 已复习，下次 2026-05-12
+- [Multi-Agent 架构] — 2026-04-27
+- [MCP 6 子概念] — 2026-04-21 → 2026-05-05
+- [Bridge 6 子概念] — 2026-04-21 → 2026-05-05
+- [Skill Hooks 概述 + 类型体系 + SKILL.md 声明] — 2026-04-21

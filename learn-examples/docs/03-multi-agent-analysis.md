@@ -21,6 +21,8 @@ Claude Code 的 Multi-Agent 不是独立系统，而是通过**一个特殊的 T
 
 主 Agent 并不感知自己在"协调多个 Agent"——它只是在**调用一个工具**。
 
+这里的 spawn 是指 临时创建一个 后台执行的子Agent
+
 ---
 
 ## 2. 层级式协作架构
@@ -36,7 +38,40 @@ Claude Code 的 Multi-Agent 不是独立系统，而是通过**一个特殊的 T
 
 ---
 
-## 3. Agent 定义的数据结构
+## 3. runAgent()：所有 Agent 的统一执行入口
+
+**核心结论**：Skill fork、内置 Explore/Plan/Verification、Teammates——所有子 agent 最终都调用 `runAgent()` 作为统一入口，执行机制完全相同。
+
+区别仅在于 **agent 定义来源**：
+- **内置 agent**：预定义在 `agentDefinitions` 中
+- **Skill fork**：由 `SKILL.md` frontmatter 动态构建
+
+```
+                          ┌──────────────────────────────────────┐
+                          │           runAgent()                  │
+                          │     （所有 agent 共享的生成器函数）    │
+                          └──────────────┬───────────────────────┘
+                                         │
+          ┌──────────────────────────────┼──────────────────────────────┐
+          │                              │                              │
+          ▼                              ▼                              ▼
+   ┌─────────────┐              ┌─────────────┐               ┌─────────────┐
+   │ Skill fork   │              │  内置 Agent  │               │  Teammate    │
+   │ (SKILL.md)   │              │ (explore/    │               │ (async/      │
+   │              │              │  plan/...)   │               │  tmux)       │
+   └─────────────┘              └─────────────┘               └─────────────┘
+          │                              │                              │
+          └──────────────────────────────┼──────────────────────────────┘
+                                         │
+                          ┌──────────────▼──────────────┐
+                          │  createSubagentContext()      │
+                          │  （共享的隔离机制）           │
+                          └─────────────────────────────┘
+```
+
+---
+
+## 4. AgentDefinition 完整配置
 
 每个 Agent 本质是一个配置对象（`AgentDefinition`）：
 
@@ -65,12 +100,20 @@ export const EXPLORE_AGENT: BuiltInAgentDefinition = {
 | `tools` / `disallowedTools` | 控制子 Agent 能用什么工具 |
 | `model` | 可以指定不同的模型（如 haiku 更便宜更快） |
 | `getSystemPrompt()` | 专属系统提示词，定义角色和行为边界 |
+| `permissionMode` | 覆盖父 agent 的权限模式 |
+| `isAsync` | 是否为异步 agent（影响 shouldAvoidPermissionPrompts） |
+| `hooks` | agent 级别的 session hooks |
+| `skills` | 预加载的 skills 列表 |
+| `mcpServers` | agent 专属的 MCP servers（附加到父 agent 的 MCP 上） |
+| `source` | agent 来源（admin-trusted 判断依据） |
+| `maxTurns` | 最大执行轮次限制 |
+| `criticalSystemReminder_EXPERIMENTAL` | 关键系统提醒内容 |
 
 ---
 
-## 4. 四个内置 Agent 的分工
+## 5. 四个内置 Agent 的分工
 
-### 4.1 Explore Agent（搜索专家）
+### 5.1 Explore Agent（搜索专家）
 
 ```typescript
 agentType: 'Explore'
@@ -83,7 +126,7 @@ System Prompt 核心指令：
 - "严格只读模式 — 不能创建、修改、删除任何文件"
 - "你应该尽量并行发起多个搜索请求以提高效率"
 
-### 4.2 Plan Agent（架构师）
+### 5.2 Plan Agent（架构师）
 
 ```typescript
 agentType: 'Plan'
@@ -96,7 +139,7 @@ System Prompt 核心指令：
 - "探索代码库并设计实现方案"
 - 输出必须包含 "### Critical Files for Implementation"
 
-### 4.3 General Purpose Agent（万能执行者）
+### 5.3 General Purpose Agent（万能执行者）
 
 ```typescript
 agentType: 'general-purpose'
@@ -108,7 +151,7 @@ System Prompt 核心指令：
 - "你是 Claude Code 的通用 agent"
 - "完整完成任务 — 不要过度设计，也不要半途而废"
 
-### 4.4 Verification Agent（质量检查）
+### 5.4 Verification Agent（质量检查）
 
 ```typescript
 agentType: 'verification'  // 需要功能开关 VERIFICATION_AGENT
@@ -118,9 +161,34 @@ agentType: 'verification'  // 需要功能开关 VERIFICATION_AGENT
 
 ---
 
-## 5. 工具隔离机制
+## 6. 工具隔离机制
 
-Claude Code 通过**工具白名单/黑名单**控制每个 Agent 的能力边界：
+Claude Code 通过**工具白名单/黑名单**控制每个 Agent 的能力边界。
+
+### 过滤链路（源码视角）
+
+```
+AgentDefinition.disallowedTools / allowedTools
+        │
+        ▼
+resolveAgentTools(agentDefinition, availableTools, isAsync)
+  ──→ agentToolUtils.ts：遍历可用工具，根据 agentDefinition 过滤
+        │
+        ▼
+过滤后的 resolvedTools 列表
+        │
+        ▼
+传给 query() 执行
+```
+
+**关键代码**（`runAgent.ts` 第 500-502 行）：
+```typescript
+const resolvedTools = useExactTools
+  ? availableTools
+  : resolveAgentTools(agentDefinition, availableTools, isAsync).resolvedTools
+```
+
+### 黑名单配置
 
 ```typescript
 // Explore 和 Plan Agent 的黑名单
@@ -135,11 +203,36 @@ disallowedTools: [
 设计原则：
 - **Explore/Plan**：只读，不能改变任何东西
 - **General Purpose**：全部权限
-- **所有子 Agent**：都不能再 spawn 子 Agent（防止无限嵌套）
+- **所有子 Agent**：都不能再 spawn 子 Agent（防止无限递归）
+
+### Skill fork 的 allowed-tools 白名单
+
+Skill fork 使用 `SKILL.md` frontmatter 的 `allowed-tools` 字段限制工具范围：
+
+```yaml
+allowed-tools:
+  - ReadFileTool
+  - GrepTool
+  - GlobTool
+  # BashTool、WriteFileTool 等危险操作不在列表中，根本不会到达子 agent
+```
+
+这在 `runAgent()` 第 469-479 行生效：
+```typescript
+if (allowedTools !== undefined) {
+  toolPermissionContext = {
+    ...toolPermissionContext,
+    alwaysAllowRules: {
+      cliArg: state.toolPermissionContext.alwaysAllowRules.cliArg,
+      session: [...allowedTools],  // 白名单覆盖 session 级别规则
+    },
+  }
+}
+```
 
 ---
 
-## 6. 两种协作模式
+## 7. 两种协作模式
 
 ### 模式 A — Subagent（短任务，同进程）
 
@@ -187,9 +280,42 @@ TeammateAgentContext: {
 }
 ```
 
+### isAsync 与权限弹框机制
+
+`runAgent.ts` 第 440-451 行揭示了 `isAsync` 与 `shouldAvoidPermissionPrompts` 的关系：
+
+```typescript
+const shouldAvoidPrompts =
+  canShowPermissionPrompts !== undefined
+    ? !canShowPermissionPrompts
+    : agentPermissionMode === 'bubble'
+      ? false
+      : isAsync  // ← 核心：异步 agent 不弹权限框
+
+if (shouldAvoidPrompts) {
+  toolPermissionContext = {
+    ...toolPermissionContext,
+    shouldAvoidPermissionPrompts: true,
+  }
+}
+```
+
+| Agent 类型 | isAsync | shouldAvoidPermissionPrompts | 权限行为 |
+|-----------|---------|---------------------------|---------|
+| Skill fork 子 agent | true | true | 不弹框，继承父 agent 决定 |
+| Explore / Plan（内置同步） | false | false | **正常弹权限确认框** |
+| Teammate（内置异步） | true | true | 不弹框，继承父 agent 决定 |
+
+**关键区分**：
+
+- **同步 agent**（Explore/Plan）：`shouldAvoidPermissionPrompts = false`，调用危险工具时**会弹权限确认框**
+- **异步 agent**（Teammate/Skill fork）：`shouldAvoidPermissionPrompts = true`，跳过弹框直接继承父 agent 决定
+
+> 这是 Skill fork 和内置同步 agent 在权限行为上的本质区别——Skill fork 固定不弹框，而 Explore/Plan 同步 agent 正常弹框。
+
 ---
 
-## 7. 结果返回机制
+## 8. 结果返回机制
 
 子 Agent 完成后，结果以结构化 XML 返回：
 
@@ -211,31 +337,55 @@ TeammateAgentContext: {
 
 ---
 
-## 8. Agent 生命周期
+## 9. runAgent() 内部执行流程（源码级）
 
 ```
-1. 主 Agent 调用 AgentTool
-   ↓
-2. 解析 agentType → 找到对应的 AgentDefinition
-   ↓
-3. 构建 Agent 上下文（system prompt + tools + permissions）
-   ↓
-4. 创建独立的消息历史（fork 或 新建）
-   ↓
-5. 调用 query() 运行子 Agent（与主循环相同的 API 调用）
-   ↓
-6. 子 Agent 完成后，收集所有消息
-   ↓
-7. 提取最终文本结果 + 统计 token/工具使用
-   ↓
-8. 封装为 <task-notification> 返回给主 Agent
-   ↓
-9. 清理资源（MCP 连接、worktree 等）
+runAgent() 统一入口
+  │
+  ├── 1. 解析 agentDefinition 配置
+  │     └── 获取 allowedTools / disallowedTools / model / hooks / skills / mcpServers
+  │
+  ├── 2. resolveAgentTools()
+  │     └── 根据 agentDefinition 过滤工具列表
+  │
+  ├── 3. initializeAgentMcpServers()
+  │     └── 连接 agent 专属 MCP servers（附加到父 agent 的 MCP 上）
+  │
+  ├── 4. 省略 ClaudeMd 和 GitStatus（Explore/Plan 优化）
+  │     └── shouldOmitClaudeMd = agentDefinition.omitClaudeMd
+  │
+  ├── 5. createSubagentContext()
+  │     ├── 克隆 messages（完整 conversation history）
+  │     ├── 分配独立 agentId / depth++
+  │     ├── 设置 shouldAvoidPermissionPrompts
+  │     └── 应用 allowedTools 白名单
+  │
+  ├── 6. registerFrontmatterHooks()
+  │     └── 注册 agent 级别的 session hooks
+  │
+  ├── 7. 预加载 skills（从 agentDefinition.skills）
+  │     └── 加载 skill 内容加入 initialMessages
+  │
+  ├── 8. 调用 query() 进入 Agentic Loop
+  │     └── 与主循环共用同一套 LLM API 调用
+  │
+  ├── 9. 子 Agent 完成后，收集所有消息
+  │
+  ├── 10. 封装为 <task-notification> 返回给主 Agent
+  │
+  └── 11. 清理资源
+        ├── MCP cleanup
+        ├── clearSessionHooks
+        ├── cloneFileStateCache.clear()
+        ├── killShellTasksForAgent
+        └── unregisterPerfettoAgent
 ```
+
+**关键源码文件**：`src/tools/AgentTool/runAgent.ts`（974 行）
 
 ---
 
-## 9. Coordinator Mode（高级编排模式）
+## 10. Coordinator Mode（高级编排模式）
 
 通过 `COORDINATOR_MODE` 功能开关启用。这是一个更高级的编排模式：
 
@@ -253,13 +403,13 @@ Coordinator (编排者)
 
 ---
 
-## 10. 关键源文件索引
+## 11. 关键源文件索引
 
 | 文件 | 内容 |
 |------|------|
+| `src/tools/AgentTool/runAgent.ts` | **Agent 统一执行入口**（974 行），初始化 MCP、resolveAgentTools、createSubagentContext、query 调用 |
+| `src/tools/AgentTool/agentToolUtils.ts` | `resolveAgentTools()` 工具过滤、`result` 收集统计、`<task-notification>` 封装 |
 | `src/tools/AgentTool/AgentTool.tsx` | 主工具定义，spawn 逻辑 |
-| `src/tools/AgentTool/runAgent.ts` | Agent 运行逻辑（初始化 MCP、调用 query） |
-| `src/tools/AgentTool/agentToolUtils.ts` | 结果收集、统计、通知封装 |
 | `src/tools/AgentTool/builtInAgents.ts` | 内置 Agent 注册表 |
 | `src/tools/AgentTool/built-in/exploreAgent.ts` | 搜索专家定义 |
 | `src/tools/AgentTool/built-in/planAgent.ts` | 架构师定义 |
@@ -267,15 +417,21 @@ Coordinator (编排者)
 | `src/tools/AgentTool/loadAgentsDir.ts` | Agent 定义加载（内置 + 自定义） |
 | `src/tools/AgentTool/constants.ts` | 常量定义 |
 | `src/tools/shared/spawnMultiAgent.ts` | Teammate spawn 逻辑 |
+| `src/utils/forkedAgent.ts` | `createSubagentContext()` — Skill fork 和内置 agent 共享的隔离机制 |
+| `src/utils/hooks/registerFrontmatterHooks.ts` | agent frontmatter hooks 注册 |
+| `src/utils/hooks/sessionHooks.ts` | session hooks 管理（clearSessionHooks） |
 
 ---
 
-## 11. 设计精华总结
+## 12. 设计精华总结
 
-1. **工具化调用**：Multi-Agent 不是独立系统，而是通过 AgentTool 实现，主 Agent 视角就是"调用一个工具"
-2. **配置驱动**：每个 Agent 是一个 `AgentDefinition` 对象，定义身份、能力、限制
-3. **工具隔离**：通过 `disallowedTools` 精确控制能力边界
-4. **模型分层**：轻量任务用 haiku（快且省），重要任务用更强模型
-5. **结果结构化**：`<task-notification>` XML 格式统一返回结果和统计
-6. **防止递归**：子 Agent 不能再 spawn 子 Agent
-7. **简洁优雅**：本质就是 "LLM 调用 LLM"，不需要复杂的多进程调度
+1. **统一入口**：所有 agent（Skill fork、内置、Teammate）共享 `runAgent()` 统一入口，区别仅在 agent 定义来源
+2. **工具化调用**：Multi-Agent 不是独立系统，而是通过 AgentTool 实现，主 Agent 视角就是"调用一个工具"
+3. **配置驱动**：每个 Agent 是一个 `AgentDefinition` 对象，定义身份、能力、限制
+4. **工具隔离**：通过 `resolveAgentTools()` + `disallowedTools` 精确控制能力边界
+5. **模型分层**：轻量任务用 haiku（快且省），重要任务用更强模型
+6. **结果结构化**：`<task-notification>` XML 格式统一返回结果和统计
+7. **防止递归**：子 Agent 不能再 spawn 子 Agent（`AGENT_TOOL_NAME` 在黑名单中）
+8. **权限双重防护**：Skill fork 用 `shouldAvoidPermissionPrompts=true` + `allowed-tools` 白名单；内置同步 agent 正常弹框
+9. **隔离机制共享**：`createSubagentContext()` 同时被 Skill fork 和内置 agent 调用，克隆 messages、分配独立上下文
+10. **Agent 专属 MCP**：agent 可通过 `mcpServers` frontmatter 添加专属 MCP 连接，附加到父 agent 的 MCP 上
