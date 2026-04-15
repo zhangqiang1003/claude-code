@@ -37,7 +37,7 @@ import {
   type AgentDefinition,
   isBuiltInAgent,
   parseAgentsFromJson,
-} from 'src/tools/AgentTool/loadAgentsDir.js'
+} from '@claude-code-best/builtin-tools/tools/AgentTool/loadAgentsDir.js'
 import type { Message, NormalizedUserMessage } from 'src/types/message.js'
 import type { QueuedCommand } from 'src/types/textInputTypes.js'
 import {
@@ -200,7 +200,7 @@ import {
   getInitJsonSchema,
   setSdkAgentProgressSummariesEnabled,
 } from 'src/bootstrap/state.js'
-import { createSyntheticOutputTool } from 'src/tools/SyntheticOutputTool/SyntheticOutputTool.js'
+import { createSyntheticOutputTool } from '@claude-code-best/builtin-tools/tools/SyntheticOutputTool/SyntheticOutputTool.js'
 import { parseSessionIdentifier } from 'src/utils/sessionUrl.js'
 import {
   hydrateRemoteSession,
@@ -364,7 +364,7 @@ const proactiveModule =
     : null
 const cronSchedulerModule = require('../utils/cronScheduler.js') as typeof import('../utils/cronScheduler.js')
 const cronJitterConfigModule = require('../utils/cronJitterConfig.js') as typeof import('../utils/cronJitterConfig.js')
-const cronGate = require('../tools/ScheduleCronTool/prompt.js') as typeof import('../tools/ScheduleCronTool/prompt.js')
+const cronGate = require('@claude-code-best/builtin-tools/tools/ScheduleCronTool/prompt.js') as typeof import('@claude-code-best/builtin-tools/tools/ScheduleCronTool/prompt.js')
 const extractMemoriesModule = feature('EXTRACT_MEMORIES')
   ? (require('../services/extractMemories/extractMemories.js') as typeof import('../services/extractMemories/extractMemories.js'))
   : null
@@ -1180,7 +1180,7 @@ function runHeadlessStreaming(
     removeInterruptedMessage(mutableMessages, turnInterruptionState.message)
     enqueue({
       mode: 'prompt',
-      value: turnInterruptionState.message.message.content,
+      value: turnInterruptionState.message.message!.content as string | ContentBlockParam[],
       uuid: randomUUID(),
     })
   }
@@ -1231,13 +1231,13 @@ function runHeadlessStreaming(
         output.enqueue({
           type: 'user',
           content: crumb.message.content,
-          message: crumb.message,
+          message: crumb.message as unknown,
           session_id: getSessionId(),
           parent_tool_use_id: null,
           uuid: crumb.uuid,
           timestamp: crumb.timestamp,
           isReplay: true,
-        } as SDKUserMessageReplay as StdoutMessage)
+        } as unknown as StdoutMessage)
       }
     }
   }
@@ -1969,12 +1969,12 @@ function runHeadlessStreaming(
                 output.enqueue({
                   type: 'user',
                   content: c.value,
-                  message: { role: 'user', content: c.value },
+                  message: { role: 'user', content: c.value } as unknown,
                   session_id: getSessionId(),
                   parent_tool_use_id: null,
                   uuid: c.uuid as string,
                   isReplay: true,
-                } as SDKUserMessageReplay as StdoutMessage)
+                } as unknown as StdoutMessage)
               }
             }
           }
@@ -4090,13 +4090,13 @@ function runHeadlessStreaming(
             output.enqueue({
               type: 'user',
               content: (userMsg.message as { content?: string })?.content ?? '',
-              message: userMsg.message as { role: string; content: unknown },
+              message: userMsg.message as unknown,
               session_id: sessionId,
               parent_tool_use_id: null,
               uuid: userMsg.uuid as string,
               timestamp: (userMsg as { timestamp?: string }).timestamp,
               isReplay: true,
-            } as unknown as SDKUserMessageReplay as StdoutMessage)
+            } as unknown as StdoutMessage)
           }
           // Historical dup = transcript already has this turn's output, so it
           // ran but its lifecycle was never closed (interrupted before ack).
@@ -4554,7 +4554,7 @@ async function handleRewindFiles(
     )
     return {
       canRewind: true,
-      filesChanged: diffStats?.filesChanged,
+      filesChanged: diffStats?.filesChanged ?? [],
       insertions: diffStats?.insertions,
       deletions: diffStats?.deletions,
     }
@@ -4940,7 +4940,7 @@ async function loadInitialMessages(
               getActiveAgentsFromList,
             } =
               // eslint-disable-next-line @typescript-eslint/no-require-imports
-              require('../tools/AgentTool/loadAgentsDir.js') as typeof import('../tools/AgentTool/loadAgentsDir.js')
+              require('@claude-code-best/builtin-tools/tools/AgentTool/loadAgentsDir.js') as typeof import('@claude-code-best/builtin-tools/tools/AgentTool/loadAgentsDir.js')
             getAgentDefinitionsWithOverrides.cache.clear?.()
             const freshAgentDefs = await getAgentDefinitionsWithOverrides(
               getCwd(),
@@ -5142,7 +5142,7 @@ async function loadInitialMessages(
           // Refresh agent definitions to reflect the mode switch
           const { getAgentDefinitionsWithOverrides, getActiveAgentsFromList } =
             // eslint-disable-next-line @typescript-eslint/no-require-imports
-            require('../tools/AgentTool/loadAgentsDir.js') as typeof import('../tools/AgentTool/loadAgentsDir.js')
+            require('@claude-code-best/builtin-tools/tools/AgentTool/loadAgentsDir.js') as typeof import('@claude-code-best/builtin-tools/tools/AgentTool/loadAgentsDir.js')
           getAgentDefinitionsWithOverrides.cache.clear?.()
           const freshAgentDefs = await getAgentDefinitionsWithOverrides(
             getCwd(),
