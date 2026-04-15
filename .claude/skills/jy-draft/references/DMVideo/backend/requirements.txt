@@ -1,0 +1,6 @@
+pymediainfo
+imageio
+fastapi
+requests
+uvicorn[standard]==0.41.0
+nuitka>=4.0.1

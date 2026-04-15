@@ -1,0 +1,137 @@
+/* 更新全局样式 */
+:root {
+    --el-color-primary: #6366f1;
+    --el-color-primary-light-3: #818cf8;
+    --el-color-primary-light-5: #a5b4fc;
+    --el-color-primary-light-7: #c7d2fe;
+    --el-color-primary-light-8: #ddd6fe;
+    --el-color-primary-light-9: #e0e7ff;
+    --el-color-primary-dark-2: #4f46e5;
+}
+
+body {
+    background-color: #f9fafb;
+    color: #111827;
+}
+
+/* ==================== 自定义滚动条样式 ==================== */
+
+/* 全局滚动条样式 - 适用于所有元素 */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+/* 滚动条轨道 - 滚动条的背景区域 */
+::-webkit-scrollbar-track {
+    background: #f1f1f1;
+    border-radius: 4px;
+}
+
+/* 滚动条滑块 - 可拖动的部分 */
+::-webkit-scrollbar-thumb {
+    background: #c1c1c1;
+    border-radius: 4px;
+    transition: background 0.3s ease;
+}
+
+/* 滚动条滑块悬停状态 */
+::-webkit-scrollbar-thumb:hover {
+    background: #a8a8a8;
+}
+
+/* 滚动条滑块激活状态（拖动时） */
+::-webkit-scrollbar-thumb:active {
+    background: #8b8b8b;
+}
+
+/* 水平滚动条滑块 */
+::-webkit-scrollbar-thumb:horizontal {
+    background: #c1c1c1;
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:horizontal:hover {
+    background: #a8a8a8;
+}
+
+/* 滚动条角落（水平和垂直滚动条交汇处） */
+::-webkit-scrollbar-corner {
+    background: #f1f1f1;
+}
+
+/* Firefox 滚动条样式 */
+* {
+    scrollbar-width: thin;
+    scrollbar-color: #c1c1c1 #f1f1f1;
+}
+
+/* Element Plus 组件滚动条样式优化 */
+.el-table__body-wrapper::-webkit-scrollbar,
+.el-select-dropdown__wrap::-webkit-scrollbar,
+.el-scrollbar__wrap::-webkit-scrollbar,
+.el-dialog__body::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+
+.el-table__body-wrapper::-webkit-scrollbar-thumb,
+.el-select-dropdown__wrap::-webkit-scrollbar-thumb,
+.el-scrollbar__wrap::-webkit-scrollbar-thumb,
+.el-dialog__body::-webkit-scrollbar-thumb {
+    background: #dcdfe6;
+    border-radius: 3px;
+}
+
+.el-table__body-wrapper::-webkit-scrollbar-thumb:hover,
+.el-select-dropdown__wrap::-webkit-scrollbar-thumb:hover,
+.el-scrollbar__wrap::-webkit-scrollbar-thumb:hover,
+.el-dialog__body::-webkit-scrollbar-thumb:hover {
+    background: #c0c4cc;
+}
+
+/* 消息提示样式 */
+.el-message {
+    border-radius: 8px;
+}
+
+.el-message--success {
+    background-color: #ecfdf5;
+    border-color: #6ee7b7;
+}
+
+.el-message--error {
+    background-color: #fef2f2;
+    border-color: #fca5a5;
+}
+
+/* ==================== 禁用文本选择和图片拖拽 ==================== */
+
+/* 全局禁用文本选择 */
+* {
+    -webkit-user-select: none; /* Chrome, Safari, Opera */
+    -moz-user-select: none;    /* Firefox */
+    -ms-user-select: none;     /* Internet Explorer/Edge */
+    user-select: none;         /* 标准语法 */
+}
+
+/* 允许表单元素可选择（输入框、文本域等） */
+input, 
+textarea, 
+[contenteditable="true"],
+.el-input__inner,
+.el-textarea__inner {
+    -webkit-user-select: text;
+    -moz-user-select: text;
+    -ms-user-select: text;
+    user-select: text;
+}
+
+/* 全局禁用图片拖拽 */
+img {
+    -webkit-user-drag: none;
+    -khtml-user-drag: none;
+    -moz-user-drag: none;
+    -o-user-drag: none;
+    user-drag: none;
+}

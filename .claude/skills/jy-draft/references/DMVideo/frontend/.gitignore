@@ -1,0 +1,23 @@
+node_modules
+dist
+build
+
+# 环境变量文件
+.env
+.env.development
+.env.local
+.env.development
+
+# 保留示例文件和生产环境配置
+!.env.example
+!.env.development.example
+!.env.production
+
+.vscode
+.idea
+
+*.pyc
+*.pyi
+__pycache__/
+
+frontend/dist-all/*

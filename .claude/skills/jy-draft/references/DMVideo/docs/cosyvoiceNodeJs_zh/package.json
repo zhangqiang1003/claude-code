@@ -1,0 +1,32 @@
+{
+  "name": "cosyvoice-nodejs",
+  "version": "1.0.0",
+  "description": "CosyVoice WebSocket 语音合成服务 - Node.js 版本",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": [
+    "cosyvoice",
+    "tts",
+    "websocket",
+    "aliyun",
+    "dashscope"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.6.1",
+    "uuid": "^9.0.0",
+    "ws": "^8.13.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=14.0.0",
+    "npm": ">=6.0.0"
+  }
+}
