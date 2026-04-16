@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find e:/code/claude-code/src/tools -name *.ts -o -name *.tsx)",
+      "Bash(xargs wc:*)",
+      "Bash(find e:/code/claude-code/src/permissions -name *.ts -o -name *.tsx)",
+      "Bash(wc -l e:/code/claude-code/src/components/PromptInput/*.tsx e:/code/claude-code/src/components/PromptInput/*.ts)",
+      "Bash(find e:/code/claude-code/src/components/permissions -name *.ts -o -name *.tsx)",
+      "Bash(find e:/code/claude-code/src/tools -maxdepth 2 -name *.ts -o -name *.tsx)",
+      "Bash(find e:/code/claude-code/src/utils/permissions -name *.ts)",
+      "Bash(find e:/code/claude-code/packages/@ant/ink -name *.ts -o -name *.tsx)",
+      "Bash(find e:/code/claude-code/src/state -name *.ts -o -name *.tsx)"
+    ]
+  }
+}

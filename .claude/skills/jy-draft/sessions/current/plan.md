@@ -247,17 +247,29 @@ const useConversationStore = defineStore('conversation', {
 // 素材 Store
 const useMaterialStore = defineStore('material', {
   state: () => ({
-    materials: Material[],         // 已导入素材列表
+    materials: Material[],         // 已导入素材列表（含 video/audio/image/text 四种类型）
     selectedIds: string[],         // 当前选中素材
+    trash: Material[],             // 回收站素材
+    favorites: Material[],         // 收藏素材
+    storageStats: { used: number, byType: Record<string, number> }, // 存储统计
+    loading: boolean,              // 加载状态
+    filters: { type?: string, sort: string, query: string }, // 过滤条件
+    importProgress: { current: number, total: number, currentFile: string } | null, // 导入进度
+    analysisResults: Map<string, AnalysisResult>, // 素材 AI 分析结果缓存
   }),
 })
 
 // 权限 Store
 const usePermissionStore = defineStore('permission', {
   state: () => ({
-    allowedTools: Set<string>,     // 已授权工具
-    deniedTools: Set<string>,      // 已拒绝工具
-    pendingPrompt: PermissionPrompt | null,  // 待确认请求
+    mode: PermissionMode,                        // 当前权限模式
+    planModeState: PlanModeState,                // Plan Mode 状态
+    pendingRequests: PermissionRequest[],         // 待确认请求队列
+    showDialog: boolean,                         // 是否显示弹窗
+    currentRequest: PermissionRequest | null,     // 当前弹窗请求
+    denialMap: Map<string, DenialTrackingState>,  // 拒绝计数追踪
+    allowedTools: Set<string>,                    // 已授权工具
+    deniedTools: Set<string>,                     // 已拒绝工具
   }),
 })
 ```
@@ -570,6 +582,8 @@ const DENIAL_LIMITS = {
 | `tts_generate` | **Ask** | Deny |
 | `speech_recognize` | **Ask** | Deny |
 | `analyze_video` | **Ask** | Deny |
+| `smart_split_video` | **Ask** | Deny |
+| `vector_search_materials` | Allow | Allow |
 | `create_draft` | **Ask** | Deny |
 
 ---
@@ -1479,58 +1493,102 @@ export class JYMCPClient {
 
 > **任务拆分原则**：每个任务独立可交付、可测试、可 code review
 
-#### Phase 3.1 Permission System（8 tasks）
+#### Phase 3.1 Permission System（12 tasks）
 
-> **设计参考**：Claude Code Permission System（简化版）
-> **核心原则**：按 Tool 名称 + 内容匹配，不是按资源路径
+> **设计参考**：Claude Code Permission System（简化版，保留核心安全机制）
+> **核心原则**：按 Tool 名称 + 内容模式匹配，与架构设计 Layer 4 权限系统保持一致
 
 ##### 3.1.1 类型设计
 
 ```typescript
-// 权限模式（全局设置，影响所有权限检查）
+// ─── 权限模式（全局设置，影响所有权限检查）───
 export type PermissionMode =
-  | 'default'    // 按规则询问（默认）
-  | 'acceptAll'  // 接受所有
-  | 'denyAll'    // 拒绝所有
-  | 'auto'       // AI 自动判断（预留）
+  | 'default'        // 按规则询问（默认）
+  | 'plan'           // 只读模式（进入规划时自动切换，写操作全部 deny）
+  | 'acceptEdits'    // 接受写操作（子 Agent 专用，如 DraftBuilder）
+  | 'acceptAll'      // 接受所有（保留安全兜底检查）
+  | 'denyAll'        // 拒绝所有
+  | 'bubble'         // 上浮到父级确认（Fork Agent 专用）
+  | 'auto'           // AI 自动判断（预留，第一版不实现）
 
-// 权限行为
+// ─── 权限行为 ───
 export type PermissionBehavior = 'allow' | 'deny' | 'ask'
 
-// 规则来源（优先级：session > user > default）
-export type PermissionRuleSource = 'default' | 'user' | 'session'
+// ─── 规则来源（优先级从高到低）───
+export type PermissionRuleSource =
+  | 'session'      // 用户在当前对话中手动授权（"本次会话允许"）
+  | 'skill'        // Skill 工具的 allowedTools 白名单
+  | 'projectCfg'   // 项目级配置 .jy-draft/settings.json（团队共享）
+  | 'userCfg'      // 用户级配置 ~/.jy-draft/settings.json（跨项目）
+  | 'builtIn'      // 内置默认规则（不可覆盖）
 
-// 规则值
+// ─── 规则匹配类型 ───
+export type RuleMatchType =
+  | 'exact'        // 精确匹配：toolName 完全相等
+  | 'glob'         // 通配符匹配：mcp__draft__* 匹配 Draft Server 所有工具
+  | 'prefix'       // 前缀匹配：Bash(prefix:git) 匹配 git push 等
+
+// ─── 规则值 ───
 export type PermissionRuleValue = {
-  toolName: string           // 工具名称
-  ruleContent?: string       // 内容匹配（可选），用于精细控制
+  toolName: string           // 工具名称（如 "add_videos"、"mcp__draft"）
+  ruleContent?: string       // 内容匹配（可选），如 "*.mp4"、"drafts/**"
+  matchType?: RuleMatchType  // 匹配方式，默认 'exact'
 }
 
-// 权限规则
+// ─── 权限规则 ───
 export type PermissionRule = {
   source: PermissionRuleSource
   behavior: PermissionBehavior
   value: PermissionRuleValue
+  description?: string      // 规则描述（用户手动添加时填写，方便后续管理）
 }
 
-// 权限决策
+// ─── 权限决策 ───
 export type PermissionDecision =
   | { behavior: 'allow', updatedInput?: unknown }
-  | { behavior: 'deny', message: string }
-  | { behavior: 'ask', message: string, options: PermissionOption[] }
+  | { behavior: 'deny', message: string, decisionReason?: string }
+  | { behavior: 'ask', message: string, options: PermissionOption[], suggestions?: string[] }
 
-// 权限选项
+// ─── 权限选项 ───
 export type PermissionOption =
   | { type: 'allowOnce', label: string }           // 仅本次允许
   | { type: 'allowSession', label: string }         // 本次会话允许
-  | { type: 'deny', label: string }                // 拒绝
+  | { type: 'deny', label: string }                // 拒绝本次
+  | { type: 'denySession', label: string }         // 本次会话拒绝
 
-// 权限请求（渲染进程展示用）
+// ─── 权限请求（渲染进程展示用）───
 export interface PermissionRequest {
+  id: string                   // 请求唯一标识（用于 cancel 和 resolve）
   toolName: string
   input: unknown
-  description: string
+  description: string          // 人类可读的操作描述
+  riskLevel: 'low' | 'medium' | 'high'  // 风险等级
   timestamp: number
+}
+
+// ─── Denial Tracking（死循环防护）───
+export interface DenialTrackingState {
+  toolName: string
+  consecutiveDenials: number   // 连续拒绝次数
+  totalDenials: number         // 总拒绝次数
+  lastDenialAt: number         // 上次拒绝时间戳
+}
+
+export const DENIAL_LIMITS = {
+  maxConsecutiveDenials: 3,    // 同一工具连续拒绝上限
+  maxTotalDenials: 20,         // 总拒绝上限
+  cooldownPeriodMs: 30_000,    // 冷却期 30 秒
+}
+
+// ─── Plan Mode 状态 ───
+export interface PlanModeState {
+  isActive: boolean
+  prePlanMode: PermissionMode  // 进入 Plan 前的模式，退出时恢复
+}
+
+// ─── Tool 级权限检查钩子接口 ───
+export interface ToolPermissionCheck {
+  checkPermissions(input: unknown, context: PermissionContext): PermissionDecision
 }
 ```
 
@@ -1539,36 +1597,57 @@ export interface PermissionRequest {
 ```sql
 CREATE TABLE permission_rules (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  tool_name TEXT NOT NULL,           -- 工具名称（如 Read、Bash、mcp_call_tool）
-  rule_content TEXT,                  -- 内容匹配（可选，如 npm install）
+  tool_name TEXT NOT NULL,           -- 工具名称（如 add_videos、mcp__draft__*）
+  rule_content TEXT,                  -- 内容匹配（可选，如 *.mp4、drafts/**）
+  match_type TEXT NOT NULL DEFAULT 'exact',  -- exact/glob/prefix 匹配方式
   behavior TEXT NOT NULL,            -- allow/deny/ask
-  source TEXT NOT NULL,              -- default/user/session
+  source TEXT NOT NULL,              -- builtIn/userCfg/projectCfg/skill/session
+  description TEXT,                   -- 规则描述（用户手动添加时填写）
   created_at INTEGER NOT NULL,       -- 创建时间戳
   expires_at INTEGER                  -- 过期时间戳（可选，session 规则需要）
 );
 
 CREATE INDEX idx_permission_rules_tool ON permission_rules(tool_name);
 CREATE INDEX idx_permission_rules_source ON permission_rules(source);
+CREATE INDEX idx_permission_rules_match ON permission_rules(match_type);
 
 CREATE TABLE permission_mode (
   id INTEGER PRIMARY KEY CHECK (id = 1),
-  mode TEXT NOT NULL DEFAULT 'default',  -- default/acceptAll/denyAll/auto
+  mode TEXT NOT NULL DEFAULT 'default',  -- default/plan/acceptEdits/acceptAll/denyAll/bubble/auto
+  pre_plan_mode TEXT,                     -- 进入 Plan Mode 前的模式（用于退出恢复）
   updated_at INTEGER NOT NULL
 );
+
+-- Denial Tracking 表（持久化拒绝计数，支持跨对话统计）
+CREATE TABLE permission_denial_tracking (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tool_name TEXT NOT NULL,
+  consecutive_denials INTEGER NOT NULL DEFAULT 0,
+  total_denials INTEGER NOT NULL DEFAULT 0,
+  last_denial_at INTEGER NOT NULL,
+  last_reset_at INTEGER NOT NULL DEFAULT 0,  -- 上次成功后重置时间
+  UNIQUE(tool_name)
+);
+
+CREATE INDEX idx_denial_tracking_tool ON permission_denial_tracking(tool_name);
 ```
 
 ##### 3.1.3 任务拆解
 
 | 编号 | 任务 | 交付物 | 依赖 | 验收标准 |
 |------|------|--------|------|----------|
-| P3.1.1 | 权限类型定义 | `types/permission.ts` | - | Mode/Behavior/Rule/Decision/Option 接口定义完成 |
-| P3.1.2 | 权限存储表 | `database/migrations/` | P3.1.1 | permission_rules + permission_mode 表创建成功 |
-| P3.1.3 | 权限核心逻辑 | `permissions/manager.ts` | P3.1.2 | checkPermission() 实现：Mode 检查 → 规则匹配 → 返回决策 |
-| P3.1.4 | IPC 权限通道 | `ipc/permission.ts` | P3.1.3 | check / request / response 三个通道正常工作 |
-| P3.1.5 | 权限弹窗 UI | `components/PermissionDialog.vue` | P3.1.4 | 弹窗显示，三个选项（允许本次/本次会话/拒绝） |
-| P3.1.6 | 权限规则管理 | `permissions/rules.ts` | P3.1.3 | 规则添加（按来源）、过期清理、本次会话规则自动过期 |
-| P3.1.7 | 权限 Store | `stores/permission.ts` | P3.1.5, P3.1.6 | pendingRequests、showDialog、currentMode 状态正确 |
-| P3.1.8 | 集成测试 | `__tests__/permission/` | P3.1.7 | 正常授权/拒绝/记住/会话过期全流程通过 |
+| P3.1.1 | 权限类型定义 | `types/permission.ts` | - | Mode（含 plan/acceptEdits/bubble）/Behavior/Rule/Decision/Option/DenialTracking/PlanModeState 全部定义完成 |
+| P3.1.2 | 权限存储表 | `database/migrations/` | P3.1.1 | permission_rules（含 match_type）+ permission_mode（含 pre_plan_mode）+ permission_denial_tracking 三表创建成功 |
+| P3.1.3 | 规则匹配引擎 | `permissions/matcher.ts` | P3.1.1 | 三种匹配模式（exact/glob/prefix）正确工作；MCP Server 级别 `mcp__*__*` 通配符匹配正确 |
+| P3.1.4 | 权限核心逻辑 | `permissions/manager.ts` | P3.1.3 | checkPermission() 实现：Mode 检查 → Denial Tracking → 规则匹配 → Tool 级钩子 → 返回决策 |
+| P3.1.5 | Denial Tracking | `permissions/denialTracking.ts` | P3.1.2 | recordDenial()/recordSuccess()/shouldFallbackToPrompting() 实现正确；达到上限时向 AI 注入策略变更消息 |
+| P3.1.6 | Plan Mode 管理 | `permissions/planMode.ts` | P3.1.2 | enterPlanMode()/exitPlanMode() 正确保存/恢复 prePlanMode；Plan 下写操作自动 Deny |
+| P3.1.7 | IPC 权限通道 | `ipc/permission.ts` | P3.1.4 | check / request / response / cancel / rulesChanged 五个通道正常工作 |
+| P3.1.8 | 权限弹窗 UI | `components/PermissionDialog.vue` | P3.1.7 | 弹窗显示，四个选项（允许本次/本次会话允许/拒绝本次/本次会话拒绝）+ 查看详情展开 |
+| P3.1.9 | 权限规则管理 | `permissions/rules.ts` | P3.1.4 | 规则添加（按 5 种来源）、过期清理、session 规则自动过期、规则 CRUD |
+| P3.1.10 | 权限 Store | `stores/permission.ts` | P3.1.8, P3.1.9 | pendingRequests、showDialog、currentMode、planModeState、denialMap 状态正确 |
+| P3.1.11 | 默认权限矩阵 | `permissions/defaultRules.ts` | P3.1.4 | 13 个工具的 Default + Plan 模式默认规则注册正确（与架构设计 §7 矩阵一致） |
+| P3.1.12 | 集成测试 | `__tests__/permission/` | P3.1.10 | 授权/拒绝/记住/会话过期/Denial Tracking 死循环防护/Plan Mode 切换/规则匹配引擎全流程通过 |
 
 ##### 3.1.4 核心检查流程
 
@@ -1579,33 +1658,78 @@ Tool 调用请求
 PermissionManager.checkPermission(toolName, input)
      │
      ├──► 1. 检查全局 Mode
-     │    ├── 'acceptAll' → 返回 allow
-     │    └── 'denyAll' → 返回 deny
+     │    ├── 'plan'        → 写操作直接 deny，读操作 allow
+     │    ├── 'denyAll'     → 返回 deny
+     │    ├── 'acceptEdits' → 写操作 allow（Sub-Agent 专用，跳过弹窗）
+     │    ├── 'acceptAll'   → 跳到安全兜底检查（保留关键安全检查）
+     │    ├── 'bubble'      → 上浮到父级 Agent 的权限上下文确认
+     │    └── 'default'/'auto' → 继续后续步骤
      │
-     ├──► 2. 规则匹配（优先级：session > user > default）
-     │    ├── 匹配条件：toolName 相等 AND (ruleContent 为空 OR 内容相等)
-     │    └── 命中规则 → 返回对应 behavior
+     ├──► 2. 安全兜底检查（所有模式下都执行）
+     │    ├── 危险路径检查（如尝试写入系统目录）
+     │    ├── 内置 deny 规则检查（builtIn 级别，不可覆盖）
+     │    └── 命中 → 返回 deny + decisionReason
      │
-     └──► 3. 无匹配规则 → 返回 ask（显示弹窗）
+     ├──► 3. 规则匹配（优先级：session > skill > projectCfg > userCfg > builtIn）
+     │    ├── 3a. Deny 规则优先匹配
+     │    │    匹配引擎（RuleMatcher）：
+     │    │    ├── exact: toolName 完全相等 AND (ruleContent 为空 OR 内容相等)
+     │    │    ├── glob:  toolName 支持 mcp__draft__* 通配符，ruleContent 支持 *.mp4 模式
+     │    │    └── prefix: toolName 前缀匹配，ruleContent 前缀匹配
+     │    │    命中 deny 规则 → 返回 deny
+     │    │
+     │    ├── 3b. Allow 规则匹配
+     │    │    命中 allow 规则 → 返回 allow
+     │    │
+     │    └── 3c. Ask 规则匹配
+     │         命中 ask 规则 → 返回 ask（显示弹窗）
+     │
+     ├──► 4. Tool 级权限检查钩子
+     │    ├── tool.checkPermissions(input, context)
+     │    ├── upload_local_material: 文件路径白名单检查
+     │    ├── tts_generate: API 配额/成本提示
+     │    ├── save_draft: 草稿路径安全检查
+     │    └── analyze_video: API 调用成本提示
+     │    ↓ 返回 PermissionDecision
+     │
+     ├──► 5. Denial Tracking 检查
+     │    ├── shouldFallbackToPrompting(toolName) → 连续拒绝 ≥ 3 次
+     │    │   → 注入消息："上次工具调用被拒绝，请改变策略"
+     │    │   → AI 被迫改变策略，避免死循环
+     │    └── 达到 maxTotalDenials (20) → 强制终止并通知用户
+     │
+     └──► 6. 无匹配规则 → 返回 ask（显示弹窗）
 
 用户选择后：
-- allowOnce → 执行 Tool，不存储规则
-- allowSession → 执行 Tool，存储 session 规则（应用关闭时清除）
-- deny → 不执行 Tool
+- allowOnce   → 执行 Tool，不存储规则，recordSuccess()
+- allowSession → 执行 Tool，存储 session 规则（应用关闭时清除），recordSuccess()
+- deny        → 不执行 Tool，recordDenial()，返回拒绝原因
+- denySession → 不执行 Tool，存储 session deny 规则，recordDenial()
 ```
 
 ##### 3.1.5 与 Claude Code 的差异
 
 | 维度 | Claude Code | JY Draft |
 |------|-------------|----------|
-| 存储 | settings JSON 文件 | SQLite |
-| 规则内容 | 支持 glob 模式 | 精确匹配（简化） |
-| 来源分层 | 6 级 | 3 级（default/user/session） |
+| 存储 | settings JSON 文件 | SQLite（含 denial tracking 持久化） |
+| 规则匹配 | glob + prefix + 精确 | glob + prefix + 精确（完整对齐） |
+| 来源分层 | 7 级 | 5 级（session/skill/projectCfg/userCfg/builtIn） |
+| Denial Tracking | 有（consecutive + total 双重计数） | 有（完整对齐） |
+| Plan Mode | 有（prePlanMode 保存/恢复） | 有（完整对齐） |
+| Sub-Agent 权限 | 有（独立 permissionMode） | 有（acceptEdits/bubble 模式） |
+| 安全兜底 | bypass 模式仍保留安全检查 | acceptAll 模式保留安全兜底 |
+| Tool 级钩子 | 有（checkPermissions） | 有（ToolPermissionCheck 接口预留） |
 | AI 分类器 | 有（auto 模式） | 预留（第一版不实现） |
 | Feedback | Tab 键添加反馈 | 不需要 |
 | 导出/导入 | 支持 | 不需要 |
 
-**验收标准**：Tool 调用时弹窗正常显示，本次会话记住的规则在应用关闭前持续生效
+**验收标准**：
+1. Tool 调用时弹窗正常显示，四个选项（allowOnce/allowSession/deny/denySession）均可工作
+2. 本次会话记住的规则（allow 或 deny）在应用关闭前持续生效
+3. Denial Tracking 达到连续 3 次拒绝后向 AI 注入策略变更消息
+4. Plan Mode 下写操作自动 Deny，退出后恢复之前的模式
+5. 规则匹配引擎正确支持 exact/glob/prefix 三种模式
+6. MCP Server 级别通配符规则（如 `mcp__draft__*`）正确匹配
 
 ---
 
@@ -1623,53 +1747,79 @@ Tool 调用请求（QueryEngine / 直接调用）
          ▼
 PermissionManager.checkPermission(toolName, input)
          │
-         ├──► allow → 执行 Tool
-         ├──► deny → 返回拒绝原因（不执行 Tool）
+         ├──► allow → 执行 Tool，recordSuccess()
+         ├──► deny → 返回拒绝原因（不执行 Tool），recordDenial()
          └──► ask → 弹窗等待用户选择
-                   ├──► allowOnce → 执行 Tool（不存储规则）
-                   ├──► allowSession → 执行 Tool（存储 session 规则）
-                   └──► deny → 返回拒绝原因（不执行 Tool）
+                   ├──► allowOnce → 执行 Tool（不存储规则），recordSuccess()
+                   ├──► allowSession → 执行 Tool（存储 session 规则），recordSuccess()
+                   ├──► deny → 返回拒绝原因，recordDenial()
+                   └──► denySession → 返回拒绝原因，存储 session deny 规则，recordDenial()
 ```
 
 ##### X.2 各模块权限需求
 
-| 模块 | Tool 调用 | 需要权限检查的场景 |
-|------|----------|-------------------|
-| **MaterialManager** | addVideo / addAudio / addImage | 用户本地文件路径首次使用 |
-| | deleteMaterial | 删除用户素材文件 |
-| | scanDirectory | 扫描用户指定目录 |
-| **DraftManager** | createDraft | 首次在指定目录创建草稿 |
-| | addVideoToDraft / addAudioToDraft | 添加用户素材到草稿 |
-| | exportDraft | 导出草稿到用户指定目录 |
-| **QueryEngine** | mcp_call_tool | 所有 MCP Tool 调用前统一检查 |
-| | uploadMaterial | 上传用户素材到云端 |
+| 模块 | Tool 调用 | 需要权限检查的场景 | Tool 级钩子逻辑 |
+|------|----------|-------------------|----------------|
+| **MaterialManager** | addVideo / addAudio / addImage / addText | 用户本地文件路径首次使用 | 文件路径白名单检查 + 格式校验（P3.2.4）|
+| | deleteMaterial | 删除用户素材文件 | 二次确认 + 草稿引用检查（P3.2.13） |
+| | scanDirectory | 扫描用户指定目录 | 目录权限检查 |
+| | analyzeVideo | AI 视频分析（API 调用） | API 成本预估 + 结果确认 |
+| | smartSplitVideo | 智能分割（生成新文件） | 分割预览确认 + 磁盘空间检查 |
+| **DraftManager** | createDraft | 首次在指定目录创建草稿 | 草稿路径安全检查 |
+| | addVideoToDraft / addAudioToDraft | 添加用户素材到草稿 | 素材存在性验证 |
+| | exportDraft | 导出草稿到用户指定目录 | 输出路径安全检查 |
+| **QueryEngine** | mcp_call_tool | 所有 MCP Tool 调用前统一检查 | 按 MCP Server 级别匹配 |
+| | uploadMaterial | 上传用户素材到云端 | API 成本预估 |
 
 ##### X.3 权限拒绝时的处理策略
 
 ```
 Tool 调用被权限系统拒绝后：
-1. 记录拒绝日志（toolName、reason、timestamp）
-2. 根据拒绝来源处理：
+1. recordDenial() — 更新 Denial Tracking 计数
+2. 检查 Denial Tracking：
+   ├──► consecutiveDenials ≥ 3 → 向 AI 注入"请改变策略"消息
+   └──► totalDenials ≥ 20 → 强制终止，通知用户
+3. 根据拒绝来源处理：
    ├──► 用户主动拒绝 → 返回友好提示，引导用户去设置页面修改权限
+   ├──► Plan Mode deny → 提示当前为规划模式，写操作不可用
    ├──► session 规则过期 → 提示用户需要重新授权
    └──► denyAll 模式 → 提示用户当前为拒绝所有模式，需切换
-3. 拒绝信息反馈给 AI（如果通过 QueryEngine 调用）
-4. UI 显示权限被拒的状态
+4. 拒绝信息反馈给 AI（如果通过 QueryEngine 调用）
+5. UI 显示权限被拒的状态
 ```
 
 ##### X.4 权限与 MCP Client 的交互
 
 ```typescript
 // IPC 层统一封装权限检查
-ipcRenderer.invoke('permission:check', toolName, input).then(decision => {
+ipcMain.handle('permission:check', async (_event, toolName, input) => {
+  const decision = await permissionManager.checkPermission(toolName, input)
   switch (decision.behavior) {
     case 'allow':
       return executeTool(toolName, input)
     case 'deny':
+      recordDenial(toolName)
       return { error: decision.message }
     case 'ask':
-      return showPermissionDialog(toolName, input, decision.options)
+      // 通过 IPC 让渲染进程显示弹窗
+      const userChoice = await showPermissionDialogViaIPC(toolName, input, decision.options)
+      if (userChoice.behavior === 'allow') {
+        recordSuccess(toolName)
+        return executeTool(toolName, input)
+      }
+      recordDenial(toolName)
+      return { error: '用户拒绝了此操作' }
   }
+})
+
+// 取消通道：AI 不再需要该 Tool 时可取消等待中的弹窗
+ipcMain.handle('permission:cancel', (_event, requestId) => {
+  cancelPendingRequest(requestId)
+})
+
+// 规则变更通知：用户在设置页修改规则后通知 QueryEngine 刷新缓存
+ipcMain.on('permission:rulesChanged', () => {
+  permissionManager.refreshRuleCache()
 })
 ```
 
@@ -1680,64 +1830,224 @@ ipcRenderer.invoke('permission:check', toolName, input).then(decision => {
 │                     PermissionStore                         │
 ├─────────────────────────────────────────────────────────────┤
 │  state:                                                     │
-│    - mode: 'default' | 'acceptAll' | 'denyAll' | 'auto'   │
+│    - mode: PermissionMode (含 plan/acceptEdits/bubble)     │
+│    - planModeState: PlanModeState                           │
 │    - pendingRequests: PermissionRequest[]                  │
 │    - showDialog: boolean                                    │
 │    - currentRequest: PermissionRequest | null               │
+│    - denialMap: Map<string, DenialTrackingState>            │
 │                                                              │
 │  actions:                                                   │
 │    - checkPermission(toolName, input) → Promise<Decision>   │
 │    - requestPermission(toolName, input) → void（显示弹窗）  │
 │    - resolvePermission(requestId, option) → void            │
+│    - cancelRequest(requestId) → void                        │
 │    - setMode(mode) → void                                   │
+│    - enterPlanMode() → void（保存当前 mode，切换为 plan）   │
+│    - exitPlanMode() → void（恢复保存的 mode）               │
+│    - recordDenial(toolName) → void                          │
+│    - recordSuccess(toolName) → void                         │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+##### X.6 Sub-Agent 权限隔离
+
+子 Agent 拥有独立权限模式，不受主 Agent 当前模式限制：
+
+```typescript
+// 为子 Agent 构建独立的权限上下文
+function createWorkerPermissionContext(
+  agent: AgentDefinition,
+  parentContext: PermissionContext
+): PermissionContext {
+  return {
+    ...parentContext,
+    mode: agent.permissionMode ?? 'acceptEdits',
+    // 继承主 Agent 的已连接 MCP 工具
+    inheritedMcpTools: parentContext.mcpTools,
+  }
+}
+```
+
+| Agent | permissionMode | 说明 |
+|-------|---------------|------|
+| ExploreAgent | `default` | 只读探索，按规则询问 |
+| MaterialAnalyst | `default` | 分析素材，按规则询问 |
+| DraftBuilder | `acceptEdits` | 写操作自动放行 |
+| AudioAgent | `acceptEdits` | 写操作自动放行 |
+| PlanAgent | `plan` | 只读，写操作全部 deny |
+| ForkAgent | `bubble`（继承父） | 上浮到主终端确认 |
 
 **关键约束**：QueryEngine 不能绕过 PermissionStore 直接调用 MCP Client
 
 ---
 
-#### Phase 3.2 MaterialManager（22 tasks）
+#### Phase 3.2 MaterialManager（30 tasks）
 
-> **需求确认**：素材来源仅本地文件；不支持标签分类；回收站+7天清理；使用统计；视频缩略图；批量删除/移动/描述；重命名+别名；文件名重复检测；递归扫描；多种排序；预览播放；存储统计；收藏功能；复制导入
+> **需求确认**：素材来源仅本地文件；回收站+7天清理；使用统计；视频缩略图；批量删除/移动/描述；重命名+别名；文件名重复检测；递归扫描；多种排序；预览播放；存储统计；收藏功能；复制导入；**文本/字幕素材类型**；**格式白名单校验**；**内容 Hash 去重**；**LanceDB 向量语义搜索**；**AI 视频分析/智能分割**；**素材-草稿交叉引用完整性**
+
+> **与架构层对齐**：Layer 4 工具层 `upload_local_material` / `list_local_materials` / `analyze_video`；Multi-Agent MaterialAnalyst 前置依赖；Skill `/smart-analyze` 前置依赖
 
 | 编号 | 任务 | 交付物 | 依赖 | 验收标准 |
 |------|------|--------|------|----------|
-| P3.2.1 | 目录结构设计 | `config/storage.ts` | - | 素材根目录、日期分目录、drafts 目录配置完成 |
-| P3.2.2 | 数据库表设计 | `database/migrations/` | - | material_video/audio/image 表创建成功（含软删除、别名、描述、收藏、统计字段） |
-| P3.2.3 | 路径工具函数 | `utils/path.ts` | - | normalizePath/toFileUrl 处理 Windows/macOS 差异，支持文件复制 |
-| P3.2.4 | 视频元数据提取 | `core/material/video.ts` | P3.2.3 | 提取 duration/width/height/fps/codec 正确 |
-| P3.2.5 | 音频元数据提取 | `core/material/audio.ts` | P3.2.3 | 提取 duration/sampleRate/channels/codec 正确 |
-| P3.2.6 | 图片素材处理 | `core/material/image.ts` | P3.2.3 | 提取 width/height/size 正确 |
-| P3.2.7 | 添加素材 API | `core/material/manager.ts` | P3.2.4~6 | addVideo/addAudio/addImage 存入 SQLite 成功，支持文件名重复检测 |
-| P3.2.8 | 素材列表查询 | `core/material/query.ts` | P3.2.7 | 分页查询、类型过滤、多种排序（时间/名称/使用次数）正常 |
-| P3.2.9 | 素材搜索 | `core/material/search.ts` | P3.2.7 | 关键词搜索（文件名、路径、别名）正确 |
-| P3.2.10 | 素材删除（软删除） | `core/material/delete.ts` | P3.2.8 | 软删除到回收站，不立即删除文件 |
-| P3.2.11 | 回收站管理 | `core/material/trash.ts` | P3.2.10 | 回收站列表、恢复、彻底删除、7天自动清理 |
-| P3.2.12 | 目录扫描 | `core/material/scanner.ts` | P3.2.7 | 自动识别目录下素材并导入，支持递归扫描 |
-| P3.2.13 | 批量操作 | `core/material/batch.ts` | P3.2.8 | 批量删除、批量移动（移动文件）、批量设置描述 |
-| P3.2.14 | 视频缩略图 | `core/material/thumbnail.ts` | P3.2.4 | 为视频生成缩略图用于列表预览 |
-| P3.2.15 | 素材预览 | `core/material/preview.ts` | P3.2.4~6 | 查看元数据信息、视频预览播放、图片预览 |
-| P3.2.16 | 别名与描述 | `core/material/alias.ts` | P3.2.7 | 别名设置（用于显示和搜索）、描述字段（用户备注 + AI 描述） |
-| P3.2.17 | 收藏功能 | `core/material/favorite.ts` | P3.2.8 | 收藏/取消收藏、收藏列表单独展示 |
-| P3.2.18 | 存储统计 | `core/material/storageStats.ts` | P3.2.7 | 显示已使用空间大小统计 |
-| P3.2.19 | 导入功能 | `core/material/import.ts` | P3.2.3 | 复制导入（从其他位置复制素材到素材库） |
-| P3.2.20 | IPC 素材通道 | `ipc/material.ts` | P3.2.7~19 | add-video/list/delete/batch/import 通道正常工作 |
-| P3.2.21 | Material Store | `stores/material.ts` | P3.2.20 | materials、trash、favorites、storageStats、loading、filters 状态正确 |
-| P3.2.22 | 集成测试 | `__tests__/material/` | P3.2.21 | 添加/查询/搜索/删除/回收站/批量/导入全流程通过 |
+| **基础结构** |||||
+| P3.2.1 | 目录结构设计 | `config/storage.ts` | - | 素材根目录（按类型分 `/videos/` `/audios/` `/images/` `/texts/`）、`smaterSplit/<yyyy-mm-dd>/`、drafts 目录配置完成 |
+| P3.2.2 | 数据库表设计 | `database/migrations/` | - | material_video/audio/image/text 四张表 CREATE TABLE 完整定义（含 file_size、created_at、updated_at、软删除、别名、描述、收藏、统计字段） |
+| P3.2.3 | 路径工具函数 | `utils/path.ts` | - | normalizePath/toFileUrl/fromFileUrl 处理 Windows/macOS 差异；统一使用 `file_path` 字段名；支持文件复制/移动 |
+| P3.2.4 | 格式白名单校验 | `core/material/validator.ts` | P3.2.3 | 视频(MP4/MOV/AVI/GIF)、音频(MP3/WAV)、图片(JPG/PNG) 格式检测与拒绝；文件大小上限校验（视频 1.5GB） |
+| **元数据提取** |||||
+| P3.2.5 | 视频元数据提取 | `core/material/video.ts` | P3.2.3 | 提取 duration/width/height/fps/codec/file_size 正确 |
+| P3.2.6 | 音频元数据提取 | `core/material/audio.ts` | P3.2.3 | 提取 duration/sampleRate/channels/codec/file_size 正确 |
+| P3.2.7 | 图片素材处理 | `core/material/image.ts` | P3.2.3 | 提取 width/height/file_size/format 正确 |
+| P3.2.8 | 文本素材处理 | `core/material/text.ts` | P3.2.3 | 文本内容存储、字数统计、来源标记（manual/rewrite/extract）正确 |
+| **核心 CRUD** |||||
+| P3.2.9 | 添加素材 API | `core/material/manager.ts` | P3.2.4~8 | addVideo/addAudio/addImage/addText 存入 SQLite；文件名+内容 Hash 双重去重；导入时自动生成缩略图 |
+| P3.2.10 | 素材列表查询 | `core/material/query.ts` | P3.2.9 | 分页查询、类型过滤、多种排序（时间/名称/使用次数/文件大小）正常 |
+| P3.2.11 | 关键词搜索 | `core/material/search.ts` | P3.2.9 | 关键词搜索（file_path、别名、描述、ai_description）正确 |
+| P3.2.12 | 语义搜索（LanceDB） | `core/material/vectorSearch.ts` | P3.2.11, P3.2.24 | LanceDB 向量索引构建 + embedding 生成 + 混合搜索（关键词+向量）正确；自然语言 → 语义匹配素材 |
+| **删除与回收站** |||||
+| P3.2.13 | 素材删除（软删除） | `core/material/delete.ts` | P3.2.10 | 软删除到回收站；**删除前检查草稿引用（draft_materials.material_id）**，被引用时提示用户确认 |
+| P3.2.14 | 回收站管理 | `core/material/trash.ts` | P3.2.13 | 回收站列表、恢复、彻底删除；应用启动时检查 7 天过期记录并清理（`onAppReady` 触发） |
+| **批量与导入** |||||
+| P3.2.15 | 目录扫描导入 | `core/material/scanner.ts` | P3.2.9 | 自动识别目录下素材并导入，支持递归扫描，格式过滤 |
+| P3.2.16 | 批量操作 | `core/material/batch.ts` | P3.2.10 | 批量删除、批量移动（移动文件+更新引用路径）、批量设置描述 |
+| P3.2.17 | 导入功能 | `core/material/import.ts` | P3.2.4 | 复制导入（从其他位置复制素材到素材库）；**IPC 进度回调**（复制进度+元数据提取进度） |
+| **展示与交互** |||||
+| P3.2.18 | 视频缩略图 | `core/material/thumbnail.ts` | P3.2.5 | 为视频生成缩略图用于列表预览（**导入时自动生成**，存入 thumbnail_path 字段） |
+| P3.2.19 | 素材预览 | `core/material/preview.ts` | P3.2.5~8 | 查看元数据信息、视频预览播放、图片预览；**Electron 自定义协议 `jydraft://` 注册**用于本地文件访问 |
+| P3.2.20 | 别名与描述 | `core/material/alias.ts` | P3.2.9 | 别名设置（用于显示和搜索）、描述字段（用户备注 + AI 描述） |
+| P3.2.21 | 收藏功能 | `core/material/favorite.ts` | P3.2.10 | 收藏/取消收藏、收藏列表单独展示 |
+| P3.2.22 | 存储统计 | `core/material/storageStats.ts` | P3.2.9 | 基于 file_size 字段聚合显示已使用空间大小统计（无需遍历文件系统） |
+| P3.2.23 | 素材存在性校验 | `core/material/integrity.ts` | P3.2.10 | 检查素材文件是否仍存在；提供"重新索引"功能修复外部移动/删除的文件引用 |
+| **LanceDB 向量搜索** |||||
+| P3.2.24 | LanceDB 初始化与 Embedding | `core/material/lanceDB.ts` | P3.2.2 | LanceDB 本地初始化；调用 AI Embedding API 生成素材描述向量；向量索引写入/更新/删除 |
+| **AI 视频分析** |||||
+| P3.2.25 | AI 视频分析（短视频） | `core/material/analysis.ts` | P3.2.5, P3.2.24 | 2-10s 短视频 → AI 多模态提取文本描述 → 写入 ai_description + 生成 embedding 向量 |
+| P3.2.26 | AI 智能分割（长视频） | `core/material/smartSplit.ts` | P3.2.25 | 长视频 → AI 场景检测 → FFmpeg 切割 → 存入 `smaterSplit/<yyyy-mm-dd>/`；分析结果存入 material_analysis_result 表 |
+| P3.2.27 | 分析结果存储 | `core/material/analysisStore.ts` | P3.2.25 | material_analysis_result 表（关联素材 ID + 分割片段 JSON + AI 描述 + 关键词）CRUD |
+| **交叉集成** |||||
+| P3.2.28 | 素材-草稿引用计数 | `core/material/referenceCount.ts` | P3.2.9 | 素材被添加到草稿时 use_count+1；从草稿移除时 use_count-1；硬删除时级联清理引用 |
+| P3.2.29 | IPC 素材通道 | `ipc/material.ts` | P3.2.9~28 | add-video/add-text/list/delete/batch/import/search/vector-search/analyze 通道正常工作；**含进度回调通道** |
+| P3.2.30 | 集成测试 | `__tests__/material/` | P3.2.29 | 添加/查询/搜索/删除/回收站/批量/导入/向量搜索/AI分析/引用计数全流程通过 |
 
-##### 3.2.A 数据库表扩展字段
+##### 3.2.A 数据库表完整定义
+
+> **字段命名规范**：统一使用 `file_path`（非 `material_url`），与 DMVideo 参考代码保持一致。所有时间字段使用 Unix 毫秒时间戳。
 
 ```sql
--- material_video / material_audio / material_image 表扩展
-ALTER TABLE material_video ADD COLUMN alias TEXT;           -- 别名（显示名称 + 搜索）
-ALTER TABLE material_video ADD COLUMN description TEXT;      -- 用户备注
-ALTER TABLE material_video ADD COLUMN ai_description TEXT;   -- AI 自动描述
-ALTER TABLE material_video ADD COLUMN is_favorite INTEGER DEFAULT 0;  -- 是否收藏
-ALTER TABLE material_video ADD COLUMN use_count INTEGER DEFAULT 0;     -- 使用次数统计
-ALTER TABLE material_video ADD COLUMN is_deleted INTEGER DEFAULT 0;    -- 软删除标记
-ALTER TABLE material_video ADD COLUMN deleted_at INTEGER;             -- 删除时间戳
-ALTER TABLE material_video ADD COLUMN thumbnail_path TEXT;             -- 缩略图路径
+-- ==================== 视频素材表 ====================
+CREATE TABLE material_video (
+  id TEXT PRIMARY KEY,                         -- UUID（客户端生成）
+  file_name TEXT NOT NULL,                     -- 文件名（含扩展名）
+  file_path TEXT NOT NULL,                     -- 绝对路径（规范化后）
+  file_size INTEGER NOT NULL DEFAULT 0,        -- 文件大小（字节）
+  content_hash TEXT,                           -- 文件内容 SHA-256（去重用）
+  file_format TEXT,                            -- 文件格式（mp4/mov/avi/gif）
+  duration INTEGER,                            -- 时长（微秒）
+  width INTEGER,                               -- 宽度（px）
+  height INTEGER,                              -- 高度（px）
+  fps REAL,                                    -- 帧率
+  codec TEXT,                                  -- 视频编码（h264/h265）
+  alias TEXT,                                  -- 别名（显示名称 + 搜索）
+  description TEXT,                            -- 用户备注
+  ai_description TEXT,                         -- AI 自动描述
+  is_favorite INTEGER NOT NULL DEFAULT 0,      -- 是否收藏（0/1）
+  use_count INTEGER NOT NULL DEFAULT 0,        -- 被草稿引用次数
+  thumbnail_path TEXT,                         -- 缩略图路径
+  is_deleted INTEGER NOT NULL DEFAULT 0,       -- 软删除标记（0/1）
+  deleted_at INTEGER,                          -- 删除时间戳
+  created_at INTEGER NOT NULL,                 -- 创建时间戳
+  updated_at INTEGER NOT NULL                  -- 更新时间戳
+);
+
+CREATE INDEX idx_material_video_deleted ON material_video(is_deleted);
+CREATE INDEX idx_material_video_favorite ON material_video(is_favorite);
+CREATE INDEX idx_material_video_hash ON material_video(content_hash);
+CREATE INDEX idx_material_video_created ON material_video(created_at);
+
+-- ==================== 音频素材表 ====================
+CREATE TABLE material_audio (
+  id TEXT PRIMARY KEY,
+  file_name TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  file_size INTEGER NOT NULL DEFAULT 0,
+  content_hash TEXT,
+  file_format TEXT,                            -- 文件格式（mp3/wav）
+  duration INTEGER,                            -- 时长（微秒）
+  sample_rate INTEGER,                         -- 采样率
+  channels INTEGER,                            -- 声道数
+  codec TEXT,                                  -- 音频编码
+  alias TEXT,
+  description TEXT,
+  ai_description TEXT,
+  is_favorite INTEGER NOT NULL DEFAULT 0,
+  use_count INTEGER NOT NULL DEFAULT 0,
+  is_deleted INTEGER NOT NULL DEFAULT 0,
+  deleted_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX idx_material_audio_deleted ON material_audio(is_deleted);
+CREATE INDEX idx_material_audio_favorite ON material_audio(is_favorite);
+CREATE INDEX idx_material_audio_hash ON material_audio(content_hash);
+
+-- ==================== 图片素材表 ====================
+CREATE TABLE material_image (
+  id TEXT PRIMARY KEY,
+  file_name TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  file_size INTEGER NOT NULL DEFAULT 0,
+  content_hash TEXT,
+  file_format TEXT,                            -- 文件格式（jpg/png）
+  width INTEGER,
+  height INTEGER,
+  alias TEXT,
+  description TEXT,
+  ai_description TEXT,
+  is_favorite INTEGER NOT NULL DEFAULT 0,
+  use_count INTEGER NOT NULL DEFAULT 0,
+  thumbnail_path TEXT,                         -- 缩略图（图片可生成压缩版）
+  is_deleted INTEGER NOT NULL DEFAULT 0,
+  deleted_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX idx_material_image_deleted ON material_image(is_deleted);
+CREATE INDEX idx_material_image_hash ON material_image(content_hash);
+
+-- ==================== 文本素材表 ====================
+CREATE TABLE material_text (
+  id TEXT PRIMARY KEY,
+  content TEXT NOT NULL,                       -- 文本内容
+  char_count INTEGER NOT NULL DEFAULT 0,       -- 字数统计
+  source TEXT NOT NULL DEFAULT 'manual',       -- 来源：manual/rewrite/extract/ai
+  alias TEXT,
+  description TEXT,
+  is_favorite INTEGER NOT NULL DEFAULT 0,
+  use_count INTEGER NOT NULL DEFAULT 0,
+  is_deleted INTEGER NOT NULL DEFAULT 0,
+  deleted_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX idx_material_text_deleted ON material_text(is_deleted);
+
+-- ==================== AI 分析结果表 ====================
+CREATE TABLE material_analysis_result (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  material_id TEXT NOT NULL,                   -- 关联素材 ID
+  material_type TEXT NOT NULL,                 -- 素材类型（video/audio）
+  analysis_type TEXT NOT NULL,                 -- 分析类型：description/smart_split/keyword
+  result TEXT NOT NULL,                        -- JSON 结果（描述/分割片段/关键词）
+  model_used TEXT,                             -- 使用的 AI 模型
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX idx_analysis_material ON material_analysis_result(material_id);
+CREATE UNIQUE INDEX idx_analysis_unique ON material_analysis_result(material_id, analysis_type);
 ```
 
 ##### 3.2.B 素材导入流程
@@ -1749,72 +2059,222 @@ ALTER TABLE material_video ADD COLUMN thumbnail_path TEXT;             -- 缩略
 扫描用户选择的文件/目录
          │
          ▼
-检查文件名是否与当前文件夹重复
+格式白名单校验（P3.2.4）+ 文件大小校验
          │
-         ├──► 不重复 → 复制到素材库目录 → 添加到数据库
+         ├──► 格式不支持 → 提示用户跳过或取消
          │
-         └──► 重复 → 提示用户选择：
-                   ├──► 覆盖原有文件
-                   ├──► 重命名后添加
-                   └──► 取消导入
+         ▼
+计算文件内容 Hash（SHA-256）
+         │
+         ▼
+检查 content_hash 是否与数据库已有记录重复
+         │
+         ├──► Hash 重复 → 提示用户"已存在相同内容的素材：{已有名称}"
+         │                ├──► 跳过
+         │                └──► 仍导入（作为副本）
+         │
+         ▼
+检查 file_name 是否与当前文件夹重复
+         │
+         ├──► 不重复 → 复制到素材库目录
+         │
+         └──► 重复 → 自动重命名（追加序号：test(1).mp4）
+         │
+         ▼
+复制文件（IPC 进度回调：已复制/总大小）
+         │
+         ▼
+提取元数据（duration/width/height/codec 等）
+         │
+         ▼
+生成缩略图（视频素材自动生成）
+         │
+         ▼
+写入数据库 + 返回素材 ID
 ```
 
 ##### 3.2.C 回收站清理策略
 
 ```
-定时任务（每天凌晨检查）
+Electron app.on('ready') 触发清理检查
          │
          ▼
-查询 deleted_at < (now - 7天) 的记录
+查询所有素材表中 deleted_at < (now - 7天) AND is_deleted = 1 的记录
          │
          ▼
-彻底删除文件 + 删除数据库记录
+检查素材是否被草稿引用（draft_materials.material_id）
+         │
+         ├──► 被引用 → 跳过（仅删除 DB 记录，保留文件引用警告）
+         └──► 未引用 → 彻底删除文件 + 删除数据库记录
 ```
 
-**验收标准**：本地视频文件能正确提取元数据并存储，列表查询支持分页/排序/搜索，回收站7天后自动清理
+> **实现方式**：不使用 node-cron 或外部定时库。在 Electron Main Process `app.on('ready')` 时执行一次清理检查；同时通过 Pinia Store 暴露 `manualCleanup()` 方法供用户手动触发。
+
+##### 3.2.D 目录结构规范
+
+> 统一三种来源的目录设计矛盾：按类型优先分层，日期仅在智能分割输出中使用。
+
+```
+{素材根目录}/                        ← 用户手动指定
+├── videos/                          ← 视频素材
+│   ├── original/                    ← 原始导入文件
+│   └── smaterSplit/                 ← 智能分割输出
+│       └── 2026-04-16/              ← 按日期分目录
+│           ├── source_name_0001.mp4
+│           └── source_name_0002.mp4
+├── audios/                          ← 音频素材
+├── images/                          ← 图片素材
+└── thumbnails/                      ← 缩略图缓存
+    ├── {material_id}.jpg            ← 视频/图片缩略图
+    └── ...
+```
+
+##### 3.2.E LanceDB 向量搜索设计
+
+```typescript
+// core/material/lanceDB.ts
+
+interface MaterialVector {
+  id: string              // 素材 ID
+  materialType: string    // video/audio/image/text
+  embedding: number[]     // AI 生成的向量（维度取决于模型）
+  text: string            // 用于生成 embedding 的文本（ai_description + alias + description）
+}
+
+// 初始化
+const lancedb = await connect('~/.jy-draft/vectors/')  // 本地 LanceDB 路径
+
+// 索引操作
+await table.add(vectors)       // 添加向量
+await table.delete({id})       // 删除向量
+await table.update({id, ...})  // 更新向量
+
+// 搜索：混合策略
+async function hybridSearch(query: string, options: SearchOptions): Promise<Material[]> {
+  // 1. 关键词搜索（SQLite FTS）
+  const keywordResults = await keywordSearch(query)
+  // 2. 向量语义搜索（LanceDB）
+  const queryEmbedding = await generateEmbedding(query)
+  const vectorResults = await table.search(queryEmbedding).limit(20)
+  // 3. 合并 + 去重 + 排序（RRF 或加权融合）
+  return mergeResults(keywordResults, vectorResults)
+}
+```
+
+**Embedding 生成策略**：
+- 素材导入时：`alias + description + ai_description + file_name` → 生成 embedding
+- AI 分析完成时：`ai_description` 更新后重新生成 embedding
+- 手动修改描述时：实时更新 embedding
+
+##### 3.2.F AI 视频分析与智能分割设计
+
+```typescript
+// core/material/analysis.ts
+
+// 短视频分析（2-10s）
+async function analyzeShortVideo(materialId: string): Promise<VideoAnalysisResult> {
+  // 1. 调用 AI 多模态 API（bailian/GLM）分析视频内容
+  // 2. 提取：场景描述、文本内容、情感标签、推荐用途
+  // 3. 写入 material_analysis_result 表
+  // 4. 更新 material_video.ai_description
+  // 5. 生成 embedding 写入 LanceDB
+}
+
+// core/material/smartSplit.ts
+
+// 长视频智能分割
+async function smartSplitVideo(materialId: string): Promise<SmartSplitResult> {
+  // 1. AI 场景检测 → 识别分割点（时间戳列表）
+  // 2. 展示分割预览给用户确认（AskUserQuestion）
+  // 3. FFmpeg 按分割点切割 → 输出到 smaterSplit/<yyyy-mm-dd>/
+  //    命名：源文件名_<xxxx序号>.后缀（序号4位补0）
+  // 4. 每个片段作为新素材导入（继承原素材的 AI 描述）
+  // 5. 分割结果存入 material_analysis_result（analysis_type='smart_split'）
+}
+
+// 分割片段的 result JSON 结构
+interface SmartSplitResult {
+  sourceMaterialId: string
+  segments: Array<{
+    startTime: number           // 微秒
+    endTime: number             // 微秒
+    outputFileName: string      // 输出文件名
+    newMaterialId: string       // 新素材 ID
+    sceneDescription: string    // AI 场景描述
+  }>
+}
+```
+
+**验收标准**：
+1. 本地视频/音频/图片/文本素材能正确提取元数据并存储
+2. 列表查询支持分页/排序/搜索（关键词 + 向量语义混合搜索）
+3. 回收站应用启动时自动清理 7 天过期记录
+4. AI 视频分析能提取短视频描述并生成 embedding
+5. 长视频智能分割能切割视频并作为新素材导入
+6. 素材删除前检查草稿引用，被引用时提示用户确认
+7. 格式白名单校验拒绝不支持的文件格式
+8. 导入时自动生成缩略图，支持文件内容 Hash 去重
 
 ---
 
-#### Phase 3.3 DraftManager（13 tasks）
+#### Phase 3.3 DraftManager（22 tasks）
 
-> **设计决策汇总**（2026-04-15 深度讨论确认）：
+> **设计决策汇总**（2026-04-16 深度分析修订）：
 >
 > | 决策维度 | 方案 |
 > |----------|------|
-> | 草稿状态机 | 方案A：5 状态（EMPTY/EDITING/SAVED/EXPORTED/ARCHIVED） |
-> | 数据模型 | 方案C：引用+导出解析（存素材 ID，导出时解析为文件路径） |
-> | 数据库表 | 方案A：统一关联表（draft_main + draft_materials + draft_versions） |
-> | MCP 交互 | 方案B：即时创建（每次操作同步 MCP，本地 SQLite 做备份） |
-> | MaterialInfo 构建 | 方案A：客户端构建（Electron 提取元数据，构建完整 Info） |
-> | 特效/滤镜 | 延后到 Phase 4（第一版只做基础素材：视频/音频/文本） |
-> | 保存/导出 | 方案A：分离（save → MCP Server, export → 剪映 JSON）+ 版本管理 |
-> | 列表查询 | 全功能：排序 + 状态过滤 + 关键词搜索 + 统计信息 |
+> | 草稿状态机 | 7 状态（EMPTY/EDITING/DIRTY/SAVED/EXPORTED/ERROR/ARCHIVED），增加 DIRTY 和 ERROR |
+> | 数据模型 | 引用+导出解析（存素材 ID，导出时解析为文件路径） |
+> | 数据库表 | 4 表（draft_main + draft_tracks + draft_materials + draft_versions） |
+> | Track 模型 | 一等实体：draft_tracks 表 + TrackType 6 种（video/audio/text/sticker/effect/filter） |
+> | Timeline | 基础操作：generate_timelines + reorderSegments + trimSegment + removeSegment |
+> | MCP 交互 | 即时创建 + 本地快照兜底（每次 save 导出本地 JSON 快照，MCP 重启可恢复） |
+> | MaterialInfo 构建 | 客户端构建（Electron 提取元数据，构建完整 Info） |
+> | 素材类型 | 扩展 MaterialType：video/audio/text/sticker/image（为 Phase 5 effect/filter 预留） |
+> | 特效/滤镜/关键帧 | 数据模型预留（material_type 枚举可扩展），具体逻辑延后 Phase 5 |
+> | 保存/导出 | 分离（save → MCP Server, export → 剪映 JSON）+ 版本管理 |
+> | 列表查询 | 全功能：排序 + 状态过滤 + FTS5 关键词搜索 + 统计信息 |
 
-##### 3.3.1 草稿状态机
+##### 3.3.1 草稿状态机与核心类型
 
 ```typescript
 // types/draft.ts
 
-/** 草稿状态（5 种） */
+/** 草稿状态（7 种） */
 export enum DraftStatus {
   EMPTY    = 'EMPTY',     // 创建后无素材
-  EDITING  = 'EDITING',   // 有素材，编辑中
+  EDITING  = 'EDITING',   // 有素材，编辑中（与 MCP 同步）
+  DIRTY    = 'DIRTY',     // 本地有未保存修改（需要 saveDraft）
   SAVED    = 'SAVED',     // 已保存到 MCP Server
   EXPORTED = 'EXPORTED',  // 已导出为剪映 JSON
+  ERROR    = 'ERROR',     // MCP 调用失败 / 导出异常
   ARCHIVED = 'ARCHIVED',  // 已归档（不活跃）
 }
 
 /** 允许的状态转换 */
 export const DRAFT_TRANSITIONS: Record<DraftStatus, DraftStatus[]> = {
   EMPTY:    [DraftStatus.EDITING, DraftStatus.ARCHIVED],
-  EDITING:  [DraftStatus.SAVED, DraftStatus.EDITING, DraftStatus.ARCHIVED],
-  SAVED:    [DraftStatus.EDITING, DraftStatus.EXPORTED, DraftStatus.ARCHIVED],
-  EXPORTED: [DraftStatus.EDITING, DraftStatus.SAVED, DraftStatus.ARCHIVED],
+  EDITING:  [DraftStatus.DIRTY, DraftStatus.SAVED, DraftStatus.EDITING, DraftStatus.ARCHIVED, DraftStatus.ERROR],
+  DIRTY:    [DraftStatus.SAVED, DraftStatus.EDITING, DraftStatus.ERROR, DraftStatus.ARCHIVED],
+  SAVED:    [DraftStatus.DIRTY, DraftStatus.EDITING, DraftStatus.EXPORTED, DraftStatus.ARCHIVED, DraftStatus.ERROR],
+  EXPORTED: [DraftStatus.DIRTY, DraftStatus.EDITING, DraftStatus.SAVED, DraftStatus.ARCHIVED, DraftStatus.ERROR],
+  ERROR:    [DraftStatus.EDITING, DraftStatus.DIRTY],  // 可重试恢复
   ARCHIVED: [DraftStatus.EDITING],  // 恢复归档
 }
 
-/** 素材类型 */
-export type MaterialType = 'video' | 'audio' | 'text'
+/** 轨道类型（映射 pjy TrackType） */
+export enum TrackType {
+  VIDEO  = 'video',
+  AUDIO  = 'audio',
+  TEXT   = 'text',
+  STICKER = 'sticker',
+  EFFECT = 'effect',   // Phase 5 实现
+  FILTER = 'filter',   // Phase 5 实现
+}
+
+/** 素材类型（扩展，兼容 Phase 5） */
+export type MaterialType = 'video' | 'audio' | 'text' | 'sticker' | 'image'
+// Phase 5 扩展: | 'effect' | 'filter' | 'keyframe'
 
 /** 草稿配置 */
 export interface DraftConfig {
@@ -1831,31 +2291,43 @@ export interface DraftStats {
   videoCount: number
   audioCount: number
   textCount: number
+  stickerCount: number
+  imageCount: number
   totalDuration: number  // 微秒
+  trackCount: number
 }
 ```
 
 **状态转换图**：
 
 ```
-  ┌──────────────────────────────────────────────────────┐
-  │                                                      │
-  ▼                                                      │
-EMPTY ──(addMaterial)──► EDITING ◄─────────────────────┐ │
-  │                         │                           │ │
-  │                   (saveDraft)                       │ │
-  │                         │                           │ │
-  │                         ▼                           │ │
-  │                       SAVED ──(addMaterial)─────────┘ │
-  │                         │                             │
-  │                   (exportDraft)                       │
-  │                         │                             │
-  │                         ▼                             │
-  │                     EXPORTED ──(addMaterial)──► EDITING
-  │                         │
-  │                   (archive)
-  │                         │
-  └─────────────────────► ARCHIVED ──(restore)──► EDITING
+  ┌────────────────────────────────────────────────────────────┐
+  │                                                            │
+  ▼                                                            │
+EMPTY ──(addMaterial)──► EDITING ◄──────────────────────────┐  │
+  │                         │ ▲                              │  │
+  │                    (local edit)                          │  │
+  │                         │ │(saveDraft)                   │  │
+  │                         ▼ │                              │  │
+  │                       DIRTY ──(saveDraft)──► SAVED       │  │
+  │                         │                    │           │  │
+  │                    (MCP error)          (addMaterial)    │  │
+  │                         │                    │           │  │
+  │                         ▼                    ▼           │  │
+  │                       ERROR              EDITING ◄───────┘  │
+  │                       │   │                                  │
+  │                  (retry) (retry)                              │
+  │                       │   │                                  │
+  │                       ▼   ▼                                  │
+  │                     EDITING/DIRTY                            │
+  │                                                              │
+  │                        SAVED ──(exportDraft)──► EXPORTED     │
+  │                                              │               │
+  │                    EXPORTED ──(addMaterial)──► DIRTY         │
+  │                                              │               │
+  │                                        (archive)            │
+  │                                              │               │
+  └──────────────────────────────────────────► ARCHIVED ──(restore)──► EDITING
 ```
 
 ##### 3.3.2 数据库表设计
@@ -1865,17 +2337,21 @@ EMPTY ──(addMaterial)──► EDITING ◄───────────�
 CREATE TABLE draft_main (
   id TEXT PRIMARY KEY,                    -- UUID（客户端生成）
   name TEXT NOT NULL,                     -- 草稿名称
-  status TEXT NOT NULL DEFAULT 'EMPTY',   -- DraftStatus 枚举值
+  status TEXT NOT NULL DEFAULT 'EMPTY',   -- DraftStatus 枚举值（7 种）
   width INTEGER NOT NULL DEFAULT 1920,
   height INTEGER NOT NULL DEFAULT 1080,
   fps INTEGER NOT NULL DEFAULT 30,
   mcp_draft_id TEXT,                      -- MCP Server 返回的 draft_id
   output_folder TEXT,                     -- 导出目录
-  thumbnail_path TEXT,                    -- 缩略图路径
+  thumbnail_path TEXT,                    -- 缩略图路径（导出时自动截取第一帧）
   description TEXT,                       -- 用户/AI 描述
-  video_count INTEGER DEFAULT 0,          -- 视频素材数
-  audio_count INTEGER DEFAULT 0,          -- 音频素材数
-  text_count INTEGER DEFAULT 0,           -- 文本素材数
+  snapshot_path TEXT,                     -- 本地快照路径（JSON，MCP 恢复用）
+  error_message TEXT,                     -- ERROR 状态时的错误详情
+  video_count INTEGER DEFAULT 0,          -- 视频素材数（反规范化，addMaterial 递增 / removeMaterial 递减）
+  audio_count INTEGER DEFAULT 0,
+  text_count INTEGER DEFAULT 0,
+  sticker_count INTEGER DEFAULT 0,
+  image_count INTEGER DEFAULT 0,
   total_duration INTEGER DEFAULT 0,       -- 总时长（微秒）
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
@@ -1885,25 +2361,52 @@ CREATE TABLE draft_main (
 CREATE INDEX idx_draft_main_status ON draft_main(status);
 CREATE INDEX idx_draft_main_updated ON draft_main(updated_at);
 
+-- FTS5 全文搜索索引（支持 listDrafts keyword 搜索）
+CREATE VIRTUAL TABLE draft_main_fts USING fts5(
+  name,
+  description,
+  content=draft_main,
+  content_rowid=rowid
+);
+
+-- ==================== 轨道表（一等实体，映射 pjy Track） ====================
+CREATE TABLE draft_tracks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  draft_id TEXT NOT NULL REFERENCES draft_main(id) ON DELETE CASCADE,
+  track_type TEXT NOT NULL,               -- TrackType: video/audio/text/sticker/effect/filter
+  track_name TEXT,                        -- 轨道名（可选，默认按 track_type 自动命名）
+  track_index INTEGER NOT NULL DEFAULT 0, -- 轨道顺序（render_index 简化版）
+  mute INTEGER NOT NULL DEFAULT 0,        -- 0=未静音, 1=静音
+  segment_count INTEGER DEFAULT 0,        -- 轨道内片段数（反规范化）
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX idx_draft_tracks_draft ON draft_tracks(draft_id);
+CREATE UNIQUE INDEX idx_draft_tracks_unique ON draft_tracks(draft_id, track_type, track_index);
+
 -- ==================== 草稿素材关联表 ====================
 CREATE TABLE draft_materials (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   draft_id TEXT NOT NULL REFERENCES draft_main(id) ON DELETE CASCADE,
-  material_type TEXT NOT NULL,            -- video/audio/text
+  track_id INTEGER,                       -- 所属轨道（引用 draft_tracks.id，可选用于 Phase 5 effect/filter）
+  material_type TEXT NOT NULL,            -- video/audio/text/sticker/image（Phase 5 扩展: effect/filter/keyframe）
   material_id TEXT,                       -- 引用素材库 ID（可选，AI 生成的无）
-  material_url TEXT NOT NULL,             -- 实际文件路径/URL
-  track_name TEXT,                        -- 轨道名（可选）
-  track_index INTEGER DEFAULT 0,          -- 轨道索引
-  segment_index INTEGER DEFAULT 0,        -- 片段索引
-  sort_order INTEGER DEFAULT 0,           -- 排序权重
+  material_url TEXT,                      -- 文件路径/URL（NULLABLE：文本/效果/关键帧无文件）
+  segment_id TEXT,                        -- 片段 UUID（pjy segment ID，MCP 返回）
+  sort_order INTEGER NOT NULL DEFAULT 0,  -- 轨道内排序（批量添加时自动递增）
   duration INTEGER,                       -- 时长（微秒）
-  start_offset INTEGER DEFAULT 0,         -- 在时间线上的起始偏移（微秒）
-  extra_data TEXT,                        -- JSON：MCP 返回的附加数据
-  created_at INTEGER NOT NULL
+  source_start INTEGER DEFAULT 0,         -- 源裁剪起始（微秒，trim 操作修改此值）
+  source_end INTEGER,                     -- 源裁剪结束（微秒）
+  start_offset INTEGER DEFAULT 0,         -- 时间线上起始偏移（微秒）
+  extra_data TEXT,                        -- JSON：{ style?: TextStyle, transform?: ClipSettings, fade?: AudioFade, ... }
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
 );
 
 CREATE INDEX idx_draft_materials_draft ON draft_materials(draft_id);
 CREATE INDEX idx_draft_materials_type ON draft_materials(material_type);
+CREATE INDEX idx_draft_materials_track ON draft_materials(track_id);
+CREATE INDEX idx_draft_materials_sort ON draft_materials(draft_id, track_id, sort_order);
 
 -- ==================== 草稿版本表 ====================
 CREATE TABLE draft_versions (
@@ -1911,8 +2414,10 @@ CREATE TABLE draft_versions (
   draft_id TEXT NOT NULL REFERENCES draft_main(id) ON DELETE CASCADE,
   version_number INTEGER NOT NULL,        -- 自增版本号
   folder_path TEXT NOT NULL,              -- 导出文件夹路径
-  file_count INTEGER DEFAULT 0,           -- 包含的文件数
-  total_size INTEGER DEFAULT 0,           -- 总大小（字节）
+  snapshot_json TEXT,                     -- 版本快照 JSON（draft_content.json 内容，回滚用）
+  material_refs TEXT,                     -- JSON 数组：版本引用的素材 ID 列表（回滚时校验用）
+  file_count INTEGER DEFAULT 0,
+  total_size INTEGER DEFAULT 0,
   note TEXT,                              -- 版本备注（用户/AI）
   created_at INTEGER NOT NULL
 );
@@ -1921,27 +2426,36 @@ CREATE INDEX idx_draft_versions_draft ON draft_versions(draft_id);
 CREATE UNIQUE INDEX idx_draft_versions_unique ON draft_versions(draft_id, version_number);
 ```
 
-##### 3.3.3 任务拆解（13 tasks）
+##### 3.3.3 任务拆解（22 tasks）
 
 | 编号 | 任务 | 交付物 | 依赖 | 验收标准 |
 |------|------|--------|------|----------|
-| P3.3.1 | 草稿状态机与类型 | `types/draft.ts` | - | DraftStatus 5枚举 + DRAFT_TRANSITIONS 转换表 + DraftConfig/DraftStats 接口 |
-| P3.3.2 | 草稿数据库表 | `database/migrations/` | P3.3.1 | draft_main + draft_materials + draft_versions 表创建成功 |
-| P3.3.3 | 创建草稿 | `core/draft/create.ts` | P3.3.1~2 | createDraft(config) → MCP create_draft → 存储 mcp_draft_id → 本地状态 EMPTY |
-| P3.3.4 | MaterialInfo 构建器 | `core/draft/materialInfo.ts` | P3.3.1 | buildVideoInfo/buildAudioInfo/buildTextInfo：Electron 提取元数据 → 构建 MCP 格式 Info |
-| P3.3.5 | 添加素材（统一） | `core/draft/addMaterial.ts` | P3.3.3, P3.3.4 | addMaterial(draftId, type, infos) → MCP add_* → 更新本地 draft_materials + 状态 → EDITING |
-| P3.3.6 | 草稿保存 | `core/draft/save.ts` | P3.3.5 | saveDraft(draftId) → MCP save_draft → 状态更新为 SAVED |
-| P3.3.7 | 草稿导出 | `core/draft/export.ts` | P3.3.6 | exportDraft(draftId) → MCP generate_jianying_draft → 保存到 output_folder → 状态 EXPORTED |
-| P3.3.8 | 草稿版本管理 | `core/draft/version.ts` | P3.3.7 | 每次导出自增版本号、记录文件夹路径；listVersions / rollbackVersion 正常 |
-| P3.3.9 | 草稿列表 | `core/draft/list.ts` | P3.3.2 | listDrafts({sort, filter, search, page}) 返回含统计信息的草稿列表 |
-| P3.3.10 | 草稿删除 | `core/draft/delete.ts` | P3.3.3 | deleteDraft(draftId) → MCP delete_draft → 删除本地记录 + 级联删除素材和版本 |
-| P3.3.11 | IPC 草稿通道 | `ipc/draft.ts` | P3.3.3~10 | create/save/generate/list/delete/addMaterial 通道正常工作 |
-| P3.3.12 | Draft Store | `stores/draft.ts` | P3.3.11 | currentDraft、draftList、versions、isLoading 状态正确 |
-| P3.3.13 | 集成测试 | `__tests__/draft/` | P3.3.12 | 创建→添加素材→保存→导出→版本管理全流程通过 |
+| P3.3.1 | 草稿状态机与核心类型 | `types/draft.ts` | - | DraftStatus 7枚举 + DRAFT_TRANSITIONS + TrackType 6种 + MaterialType 5种 + DraftConfig/DraftStats |
+| P3.3.2 | 草稿数据库表 | `database/migrations/` | P3.3.1 | draft_main + draft_tracks + draft_materials + draft_versions + FTS5 索引创建成功 |
+| P3.3.3 | 创建草稿 | `core/draft/create.ts` | P3.3.1~2 | createDraft(config) → MCP create_draft → 存储 mcp_draft_id → 默认轨道创建 → EMPTY |
+| P3.3.4 | MaterialInfo 构建器 | `core/draft/materialInfo.ts` | P3.3.1 | buildVideoInfo/buildAudioInfo/buildTextInfo/buildStickerInfo/buildImageInfo |
+| P3.3.5 | 轨道管理 | `core/draft/track.ts` | P3.3.2 | createTrack/getTracks/muteTrack/removeTrack + 自动分配 track_index |
+| P3.3.6 | 添加素材（统一） | `core/draft/addMaterial.ts` | P3.3.3~5 | addMaterial → 自动分配轨道 → MCP add_* → 更新本地 + 状态 → EDITING |
+| P3.3.7 | 移除素材 | `core/draft/removeMaterial.ts` | P3.3.6 | removeMaterial → MCP remove → 反规范化计数递减 → 状态 → DIRTY |
+| P3.3.8 | 时间线操作 | `core/draft/timeline.ts` | P3.3.5 | reorderSegments / trimSegment / generateTimelines（duration-based + begin_time/end_time） |
+| P3.3.9 | 草稿元数据更新 | `core/draft/update.ts` | P3.3.2 | updateDraft(draftId, { name?, description?, outputFolder? }) |
+| P3.3.10 | 草稿缩略图 | `core/draft/thumbnail.ts` | P3.3.3 | exportDraft 后自动截取第一帧 → 保存 thumbnail_path |
+| P3.3.11 | 草稿保存 + 本地快照 | `core/draft/save.ts` | P3.3.6 | saveDraft → MCP save_draft + 本地 JSON 快照(snapshot_path) → SAVED |
+| P3.3.12 | 草稿导出 | `core/draft/export.ts` | P3.3.11 | exportDraft → MCP generate_jianying_draft → output_folder → 截取缩略图 → EXPORTED |
+| P3.3.13 | 草稿版本管理 | `core/draft/version.ts` | P3.3.12 | 导出自增版本 + snapshot_json + material_refs；listVersions / rollbackVersion |
+| P3.3.14 | MCP 恢复机制 | `core/draft/recovery.ts` | P3.3.11 | MCP 重连后读 snapshot_path → 重建 MCP 草稿 → 恢复本地状态 |
+| P3.3.15 | 草稿列表 | `core/draft/list.ts` | P3.3.2 | listDrafts: 排序 + 状态过滤 + FTS5 搜索 + 分页 + 统计 |
+| P3.3.16 | 草稿删除 | `core/draft/delete.ts` | P3.3.3 | deleteDraft → 先标记 status=ARCHIVED → 确认后 MCP delete + 本地 CASCADE |
+| P3.3.17 | 草稿计数校验 | `core/draft/countSync.ts` | P3.3.7, P3.3.13 | recalculateCounts → 从 draft_materials 重算反规范化字段 → 修正 draft_main |
+| P3.3.18 | IPC 草稿通道 | `ipc/draft.ts` | P3.3.3~17 | 全部 CRUD + Track + Timeline + Recovery 通道正常 |
+| P3.3.19 | Draft Store | `stores/draft.ts` | P3.3.18 | currentDraft + tracks + materials + versions + dirty + error 状态正确 |
+| P3.3.20 | 草稿复制 | `core/draft/duplicate.ts` | P3.3.6 | duplicateDraft(draftId) → 克隆本地记录 + 新 MCP 草稿 |
+| P3.3.21 | FTS 同步触发器 | `database/triggers/` | P3.3.2 | draft_main INSERT/UPDATE/DELETE 时自动同步 draft_main_fts |
+| P3.3.22 | 集成测试 | `__tests__/draft/` | P3.3.19 | 全流程：创建→轨道→素材→时间线→保存→导出→版本→回滚→复制→删除 |
 
 ##### 3.3.4 核心流程详解
 
-###### A. 创建草稿流程
+###### A. 创建草稿流程（含默认轨道）
 
 ```
 用户/AI: "创建一个 1920x1080 的草稿，名字叫'生日祝福'"
@@ -1951,12 +2465,16 @@ DraftManager.createDraft({ name: "生日祝福", width: 1920, height: 1080 })
          │
          ├──► 1. 生成 UUID 作为本地 draft_id
          ├──► 2. 调 MCP create_draft(1920, 1080)
-         │        └──► 返回 mcp_draft_id
+         │        ├── 成功 → 返回 mcp_draft_id
+         │        └── 失败 → status=ERROR, 记录 error_message，返回错误
          ├──► 3. 插入 draft_main 表（status=EMPTY, mcp_draft_id）
-         └──► 4. 返回 { draft_id, mcp_draft_id, status: EMPTY }
+         ├──► 4. 创建默认轨道（映射 pjy TrackType）：
+         │        INSERT draft_tracks: (video, index=0), (audio, index=0), (text, index=0)
+         │        （sticker/effect/filter 轨道在添加对应素材时按需创建）
+         └──► 5. 返回 { draft_id, mcp_draft_id, status: EMPTY, tracks: [video, audio, text] }
 ```
 
-###### B. 添加素材流程
+###### B. 添加素材流程（含轨道分配）
 
 ```
 用户/AI: "添加 E:\videos\birthday.mp4 到草稿"
@@ -1966,41 +2484,89 @@ DraftManager.addMaterial(draft_id, 'video', [
   { material_url: 'file:///E:/videos/birthday.mp4' }
 ])
          │
-         ├──► 1. 状态检查（EMPTY/EDITING 才能添加）
-         ├──► 2. 调 buildVideoInfo(material_url) → VideoInfo
+         ├──► 1. 状态检查（EMPTY/EDITING/SAVED/EXPORTED → DIRTY 或 EDITING）
+         ├──► 2. 查找或创建轨道：
+         │        SELECT FROM draft_tracks WHERE draft_id=? AND track_type='video'
+         │        └── 不存在 → createTrack(draft_id, 'video') → MCP add_track
+         ├──► 3. 调 buildVideoInfo(material_url) → VideoInfo
          │        ├── Electron 读取文件元数据（duration/width/height/fps）
          │        └── 构建 MCP 格式的 VideoInfo JSON
-         ├──► 3. 调 MCP add_videos(mcp_draft_id, [videoInfo])
-         ├──► 4. 插入 draft_materials 表
-         ├──► 5. 更新 draft_main（video_count++, total_duration）
-         ├──► 6. 状态转换：EMPTY → EDITING（或保持 EDITING）
-         └──► 7. 返回 { success: true }
+         ├──► 4. 调 MCP add_videos(mcp_draft_id, [videoInfo])
+         │        └── 成功 → 获取 segment_id
+         │            失败 → status=ERROR, 记录 error_message, 事务回滚
+         ├──► 5. 插入 draft_materials 表（track_id, segment_id, sort_order=MAX+1）
+         ├──► 6. 更新反规范化字段：
+         │        UPDATE draft_main SET video_count=video_count+1, total_duration=total_duration+duration
+         │        UPDATE draft_tracks SET segment_count=segment_count+1 WHERE id=track_id
+         ├──► 7. 状态转换：EMPTY → EDITING；SAVED/EXPORTED → DIRTY
+         └──► 8. 返回 { success: true, segment_id }
 ```
 
-###### C. 保存+导出流程
+###### C. 时间线操作流程
 
 ```
-用户/AI: "保存并导出草稿"
+// C1: 生成时间线（按时长）
+DraftManager.generateTimelines(durations: [3000000, 7000000, 2000000])
          │
-         ▼
+         └──► 返回 [{ start: 0, duration: 3000000 }, { start: 3000000, duration: 7000000 }, ...]
+
+// C2: 生成时间线（按 begin_time/end_time）
+DraftManager.generateTimelines(segments: [{ begin_time: 2300000, end_time: 4600000 }, ...])
+
+// C3: 裁剪片段（trim）
+DraftManager.trimSegment(draft_id, material_id, { source_start: 1000000, source_end: 5000000 })
+         │
+         ├──► 1. 更新 draft_materials SET source_start=?, source_end=?
+         ├──► 2. 调 MCP 修改 segment 的 source_timerange
+         ├──► 3. 重算 total_duration
+         └──► 4. 状态 → DIRTY
+
+// C4: 重排序片段
+DraftManager.reorderSegments(draft_id, track_id, newOrder: [id3, id1, id2])
+         │
+         ├──► 1. UPDATE draft_materials SET sort_order=新序 WHERE id IN (...)
+         ├──► 2. MCP 同步排序
+         └──► 3. 状态 → DIRTY
+
+// C5: 移除素材
+DraftManager.removeMaterial(draft_id, material_id)
+         │
+         ├──► 1. 查询 material 记录（type, track_id, duration）
+         ├──► 2. 调 MCP remove segment
+         ├──► 3. DELETE draft_materials WHERE id=?
+         ├──► 4. 反规范化递减：video_count-- / audio_count-- / segment_count--
+         ├──► 5. 重算 total_duration
+         └──► 6. 状态 → DIRTY
+```
+
+###### D. 保存 + 导出 + 本地快照流程
+
+```
+// 保存（含本地快照）
 DraftManager.saveDraft(draft_id)
          │
-         ├──► 1. 状态检查（EDITING 才能保存）
+         ├──► 1. 状态检查（EDITING/DIRTY 才能保存）
          ├──► 2. 调 MCP save_draft(mcp_draft_id)
-         └──► 3. 状态转换：EDITING → SAVED
-                  │
-                  ▼
+         ├──► 3. 生成本地快照 JSON：
+         │        ├── 查询 draft_tracks + draft_materials
+         │        ├── 组装为 { canvas, tracks: [...], materials: [...] } 结构
+         │        └── 写入 {userData}/drafts/{draft_id}/snapshot.json
+         ├──► 4. UPDATE draft_main SET snapshot_path=?, status=SAVED
+         └──► 5. 状态转换：EDITING/DIRTY → SAVED
+
+// 导出
 DraftManager.exportDraft(draft_id)
          │
          ├──► 1. 状态检查（SAVED 才能导出）
          ├──► 2. 调 MCP generate_jianying_draft(mcp_draft_id, output_folder)
          │        └──► 生成 draft_content.json + draft_meta_info.json
-         ├──► 3. 插入 draft_versions（version_number 自增）
-         ├──► 4. 更新 draft_main（exported_at, status=EXPORTED）
-         └──► 5. 返回 { folder_path, version_number }
+         ├──► 3. 截取缩略图：FFmpeg 取第一帧 → thumbnail_path
+         ├──► 4. 插入 draft_versions（version_number 自增, snapshot_json=导出JSON内容, material_refs=素材ID列表）
+         ├──► 5. UPDATE draft_main SET exported_at=now, status=EXPORTED
+         └──► 6. 返回 { folder_path, version_number, thumbnail_path }
 ```
 
-###### D. 版本回滚流程
+###### E. 版本回滚流程（含素材完整性校验）
 
 ```
 用户/AI: "回滚到版本 1"
@@ -2008,11 +2574,84 @@ DraftManager.exportDraft(draft_id)
          ▼
 DraftManager.rollbackVersion(draft_id, 1)
          │
-         ├──► 1. 查询 draft_versions 获取 v1 的 folder_path
-         ├──► 2. 读取 v1 的 draft_content.json
-         ├──► 3. 重新创建草稿（新 draft_id 或覆盖当前）
-         ├──► 4. 根据 v1 的 JSON 重建素材关联
-         └──► 5. 返回 { new_draft_id, restored_from_version: 1 }
+         ├──► 1. 查询 draft_versions 获取 v1：
+         │        SELECT snapshot_json, material_refs FROM draft_versions
+         │        WHERE draft_id=? AND version_number=1
+         ├──► 2. 素材完整性校验：
+         │        ├── 解析 material_refs JSON → material_id[]
+         │        ├── 检查每个 material_id 在 material_* 表中是否存在
+         │        └── 缺失素材 → 列出警告，询问用户是否继续
+         ├──► 3. 清空当前数据：
+         │        DELETE FROM draft_materials WHERE draft_id=?
+         │        DELETE FROM draft_tracks WHERE draft_id=?
+         ├──► 4. 从 snapshot_json 重建：
+         │        ├── 解析 tracks[] → INSERT draft_tracks
+         │        ├── 解析 materials[] → INSERT draft_materials
+         │        └── 重算反规范化字段（recalculateCounts）
+         ├──► 5. MCP 重建：调 MCP create_draft + 重新 add 所有素材
+         ├──► 6. UPDATE draft_main SET status=EDITING
+         └──► 7. 返回 { draft_id, restored_from_version: 1, missing_materials: [...] }
+```
+
+###### F. MCP 恢复流程
+
+```
+// 场景：MCP Server 重启后，12h 缓存丢失
+DraftManager.recoverFromSnapshot(draft_id)
+         │
+         ├──► 1. 读取 snapshot_path 的本地快照 JSON
+         ├──► 2. 调 MCP create_draft(width, height) → 新 mcp_draft_id
+         ├──► 3. 按快照顺序重建：
+         │        ├── 遍历 tracks → MCP add_track
+         │        ├── 遍历 materials → MCP add_videos/audios/texts
+         │        └── 每次 add 记录新 segment_id
+         ├──► 4. UPDATE draft_main SET mcp_draft_id=新值, status=EDITING
+         └──► 5. 返回 { recovered: true, new_mcp_draft_id }
+```
+
+###### G. 轨道管理流程
+
+```typescript
+// core/draft/track.ts
+
+/** 创建轨道（若不存在） */
+async function ensureTrack(draftId: string, trackType: TrackType): Promise<DraftTrack> {
+  const existing = await db.get(
+    'SELECT * FROM draft_tracks WHERE draft_id = ? AND track_type = ? ORDER BY track_index LIMIT 1',
+    [draftId, trackType]
+  )
+  if (existing) return existing
+
+  const trackIndex = await getNextTrackIndex(draftId, trackType)
+  // MCP 侧：轨道在 add_videos/audios/texts 时自动创建，无需显式调用
+  return await db.insert('draft_tracks', {
+    draft_id: draftId, track_type: trackType,
+    track_index: trackIndex, mute: 0, segment_count: 0
+  })
+}
+
+/** 轨道静音/取消静音 */
+async function muteTrack(trackId: number, mute: boolean): Promise<void>
+
+/** 删除空轨道（segment_count === 0） */
+async function removeEmptyTrack(trackId: number): Promise<void>
+```
+
+###### H. 删除草稿流程（安全两步）
+
+```
+DraftManager.deleteDraft(draft_id)
+         │
+         ├── Step 1: 软删除（用户点击删除时）
+         │    ├── UPDATE draft_main SET status='ARCHIVED'
+         │    └── 前端从列表移除
+         │
+         ├── Step 2: 硬删除（用户确认 或 7天后自动清理）
+         │    ├── 调 MCP delete_draft(mcp_draft_id)
+         │    │   ├── 成功 → 本地 CASCADE DELETE（draft_tracks + draft_materials + draft_versions）
+         │    │   └── 失败 → 仅删除本地记录，记录 warning log（MCP 侧缓存会自动过期）
+         │    ├── 删除 output_folder 下的导出文件
+         │    └── 删除 snapshot_path 快照文件
 ```
 
 ##### 3.3.5 MaterialInfo 构建器接口
@@ -2036,6 +2675,9 @@ export function buildVideoInfo(meta: VideoMaterialMeta, options?: {
   volume?: number
   start_time?: number         // 微秒，裁剪起始
   end_time?: number           // 微秒，裁剪结束
+  speed?: number              // 播放速度
+  fade_in?: number            // 微秒
+  fade_out?: number           // 微秒
 }): string  // 返回 JSON 字符串
 
 /** 构建 MCP 格式的 AudioInfo */
@@ -2043,14 +2685,39 @@ export function buildAudioInfo(meta: AudioMaterialMeta, options?: {
   volume?: number
   start_time?: number
   end_time?: number
+  speed?: number
+  fade_in?: number
+  fade_out?: number
 }): string
 
-/** 构建 MCP 格式的 TextInfo */
+/** 构建 MCP 格式的 TextInfo（完整样式，映射 pjy TextSegment） */
 export function buildTextInfo(content: string, options?: {
-  font_size?: number
-  font_color?: string
+  font_size?: number          // 默认 8.0（pjy 单位）
+  font_color?: [number, number, number]  // RGB 0-1
+  bold?: boolean
+  italic?: boolean
+  underline?: boolean
+  align?: number              // 0=left, 1=center, 2=right
+  font_family?: string        // 默认 "PingFang SC"
   duration?: number           // 微秒
   position?: { x: number, y: number }
+  border?: { width: number, color: [number, number, number] }
+  background?: { color: string, alpha: number, round_radius: number }
+  shadow?: { color: string, offset_x: number, offset_y: number, blur: number }
+}): string
+
+/** 构建 MCP 格式的 StickerInfo */
+export function buildStickerInfo(resourceId: string, options?: {
+  duration?: number           // 微秒
+  position?: { x: number, y: number }
+  scale?: number
+}): string
+
+/** 构建 MCP 格式的 ImageInfo（图片作为单帧视频） */
+export function buildImageInfo(meta: { url: string, width: number, height: number }, options?: {
+  duration?: number           // 微秒，默认 3000000 (3s)
+  position?: { x: number, y: number }
+  scale?: number
 }): string
 ```
 
@@ -2059,6 +2726,7 @@ export function buildTextInfo(content: string, options?: {
 - 音频：`ffprobe` 提取 duration/sampleRate/channels/codec
 - 图片：`sharp` 或 `image-size` 提取 width/height
 - 文本：无需提取，用户/AI 指定内容和样式参数
+- 贴纸：resource_id 引用剪映内置贴纸库
 
 ##### 3.3.6 IPC 通道设计
 
@@ -2066,13 +2734,25 @@ export function buildTextInfo(content: string, options?: {
 // ipc/draft.ts
 export const DRAFT_IPC_CHANNELS = {
   // 草稿 CRUD
-  'draft:create': (config: DraftConfig) => Promise<DraftInfo>,
-  'draft:delete': (draftId: string) => Promise<void>,
-  'draft:get':    (draftId: string) => Promise<DraftInfo | null>,
-  'draft:list':   (query: DraftListQuery) => Promise<PaginatedResult<DraftInfo>>,
+  'draft:create':   (config: DraftConfig) => Promise<DraftInfo>,
+  'draft:delete':   (draftId: string, hard?: boolean) => Promise<void>,
+  'draft:get':      (draftId: string) => Promise<DraftInfo | null>,
+  'draft:list':     (query: DraftListQuery) => Promise<PaginatedResult<DraftInfo>>,
+  'draft:update':   (draftId: string, updates: Partial<Pick<DraftConfig, 'name' | 'description' | 'outputFolder'>>) => Promise<void>,
+  'draft:duplicate': (draftId: string, newName?: string) => Promise<DraftInfo>,
+
+  // 轨道操作
+  'draft:get-tracks': (draftId: string) => Promise<DraftTrack[]>,
+  'draft:mute-track': (trackId: number, mute: boolean) => Promise<void>,
 
   // 素材操作
-  'draft:add-material': (draftId: string, type: MaterialType, items: MaterialItem[]) => Promise<void>,
+  'draft:add-material':    (draftId: string, type: MaterialType, items: MaterialItem[]) => Promise<void>,
+  'draft:remove-material': (draftId: string, materialId: number) => Promise<void>,
+
+  // 时间线操作
+  'draft:generate-timelines': (segments: TimelineSegment[]) => Promise<TimelineSlot[]>,
+  'draft:reorder-segments':   (draftId: string, trackId: number, newOrder: number[]) => Promise<void>,
+  'draft:trim-segment':       (draftId: string, materialId: number, trim: TrimOptions) => Promise<void>,
 
   // 保存/导出
   'draft:save':   (draftId: string) => Promise<void>,
@@ -2080,7 +2760,10 @@ export const DRAFT_IPC_CHANNELS = {
 
   // 版本管理
   'draft:list-versions':  (draftId: string) => Promise<DraftVersion[]>,
-  'draft:rollback':       (draftId: string, versionNumber: number) => Promise<DraftInfo>,
+  'draft:rollback':       (draftId: string, versionNumber: number) => Promise<RollbackResult>,
+
+  // MCP 恢复
+  'draft:recover': (draftId: string) => Promise<RecoveryResult>,
 
   // 统计
   'draft:stats': (draftId: string) => Promise<DraftStats>,
@@ -2091,8 +2774,8 @@ interface DraftListQuery {
   pageSize?: number
   sort?: 'created_at' | 'updated_at' | 'name'
   sortOrder?: 'asc' | 'desc'
-  status?: DraftStatus        // 过滤状态
-  keyword?: string            // 搜索名称/描述
+  status?: DraftStatus
+  keyword?: string
 }
 
 interface ExportResult {
@@ -2100,6 +2783,32 @@ interface ExportResult {
   versionNumber: number
   fileCount: number
   totalSize: number
+  thumbnailPath: string
+}
+
+interface RollbackResult {
+  draftId: string
+  restoredFromVersion: number
+  missingMaterials: string[]  // 缺失的素材 ID
+}
+
+interface RecoveryResult {
+  recovered: boolean
+  newMcpDraftId: string
+}
+
+interface TrimOptions {
+  sourceStart: number   // 微秒
+  sourceEnd: number     // 微秒
+}
+
+type TimelineSegment =
+  | number  // duration 微秒
+  | { begin_time: number, end_time: number }
+
+interface TimelineSlot {
+  start: number     // 微秒
+  duration: number  // 微秒
 }
 ```
 
@@ -2111,7 +2820,8 @@ interface ExportResult {
 export interface DraftState {
   // 当前编辑的草稿
   currentDraft: DraftInfo | null
-  currentMaterials: DraftMaterial[]
+  currentTracks: DraftTrack[]           // 当前草稿的轨道列表
+  currentMaterials: DraftMaterial[]     // 当前草稿的素材列表
 
   // 草稿列表
   drafts: DraftInfo[]
@@ -2124,87 +2834,140 @@ export interface DraftState {
   // 加载状态
   isLoading: boolean
   isExporting: boolean
-  error: string | null
+  isDirty: boolean                      // 本地有未保存修改
+  error: string | null                  // ERROR 状态详情
+  mcpConnected: boolean                 // MCP Server 连接状态
 }
 
 export const useDraftStore = defineStore('draft', {
   state: (): DraftState => ({ ... }),
   actions: {
+    // CRUD
     async createDraft(config: DraftConfig): Promise<DraftInfo>,
-    async deleteDraft(draftId: string): Promise<void>,
+    async deleteDraft(draftId: string, hard?: boolean): Promise<void>,
+    async updateDraft(draftId: string, updates: Partial<DraftConfig>): Promise<void>,
+    async duplicateDraft(draftId: string, newName?: string): Promise<DraftInfo>,
+    async loadDraft(draftId: string): Promise<void>,  // 设为 currentDraft + tracks + materials
+    async listDrafts(query?: Partial<DraftListQuery>): Promise<void>,
+
+    // 轨道
+    async muteTrack(trackId: number, mute: boolean): Promise<void>,
+
+    // 素材
     async addMaterial(type: MaterialType, items: MaterialItem[]): Promise<void>,
+    async removeMaterial(materialId: number): Promise<void>,
+
+    // 时间线
+    async reorderSegments(trackId: number, newOrder: number[]): Promise<void>,
+    async trimSegment(materialId: number, trim: TrimOptions): Promise<void>,
+
+    // 保存/导出
     async saveCurrentDraft(): Promise<void>,
     async exportCurrentDraft(): Promise<ExportResult>,
-    async listDrafts(query?: Partial<DraftListQuery>): Promise<void>,
+
+    // 版本
     async loadVersions(draftId: string): Promise<void>,
-    async rollbackVersion(versionNumber: number): Promise<void>,
-    async loadDraft(draftId: string): Promise<void>,  // 设为 currentDraft
+    async rollbackVersion(versionNumber: number): Promise<RollbackResult>,
+
+    // MCP 恢复
+    async recoverDraft(draftId: string): Promise<RecoveryResult>,
   },
   getters: {
     draftStats: (state): DraftStats | null => { ... },
-    canSave: (state): boolean => state.currentDraft?.status === 'EDITING',
+    canSave: (state): boolean => ['EDITING', 'DIRTY'].includes(state.currentDraft?.status ?? ''),
     canExport: (state): boolean => state.currentDraft?.status === 'SAVED',
+    canEdit: (state): boolean => ['EMPTY', 'EDITING', 'DIRTY', 'SAVED', 'EXPORTED'].includes(state.currentDraft?.status ?? ''),
+    isDirty: (state): boolean => state.currentDraft?.status === 'DIRTY',
+    hasError: (state): boolean => state.currentDraft?.status === 'ERROR',
   },
 })
 ```
 
 ##### 3.3.8 与 Phase 3.1（权限）的集成
 
-| 操作 | 需要权限检查 | 说明 |
-|------|:----:|------|
-| createDraft | ✓ | 首次在目录创建 |
-| addMaterial | ✓ | 访问用户本地文件 |
-| saveDraft | ✗ | MCP Server 内部操作 |
-| exportDraft | ✓ | 写入文件到用户目录 |
-| deleteDraft | ✓ | 删除草稿数据 |
-| rollbackVersion | ✗ | 内部操作 |
+| 操作 | 需要权限检查 | 权限模式 | 说明 |
+|------|:----:|----------|------|
+| createDraft | ✗ | - | 创建操作无破坏性 |
+| addMaterial | ✗ | - | 访问用户已导入的素材库 |
+| removeMaterial | ✓ | Ask | 移除素材需确认 |
+| saveDraft | ✗ | - | MCP Server 内部操作 |
+| exportDraft | ✓ | Ask | 写入文件到用户目录，需确认路径 |
+| updateDraft | ✗ | - | 修改名称/描述无破坏性 |
+| deleteDraft | ✓ | Confirm | 软删除→确认硬删除，不可逆操作 |
+| rollbackVersion | ✓ | Confirm | 版本回滚可能丢失当前修改 |
+| duplicateDraft | ✗ | - | 复制操作无破坏性 |
+| muteTrack | ✗ | - | 静音操作可恢复 |
+| reorderSegments | ✗ | - | 排序操作可撤销 |
+| trimSegment | ✗ | - | 裁剪操作可重新调整 |
+| recoverDraft | ✓ | Ask | MCP 恢复可能覆盖当前状态 |
 
 ##### 3.3.9 功能验证清单
 
 | 编号 | 功能 | 验证方法 | 预期结果 |
 |------|------|----------|----------|
-| D1.1 | 创建草稿 | createDraft({ name: "test", width: 1920, height: 1080 }) | draft_main 记录 + mcp_draft_id + status=EMPTY |
-| D1.2 | 创建草稿（MCP 失败） | MCP Server 未启动时创建 | 返回错误，本地无记录 |
-| D2.1 | 添加视频 | addMaterial(draft_id, 'video', [{ url: "file:///E:/test.mp4" }]) | draft_materials 记录 + video_count=1 + status=EDITING |
-| D2.2 | 添加音频 | addMaterial(draft_id, 'audio', [{ url: "file:///E:/test.mp3" }]) | draft_materials 记录 + audio_count=1 |
-| D2.3 | 添加文本 | addMaterial(draft_id, 'text', [{ content: "Hello" }]) | draft_materials 记录 + text_count=1 |
-| D2.4 | 批量添加 | addMaterial(draft_id, 'video', [url1, url2, url3]) | 3 条记录，sort_order 正确 |
-| D3.1 | 保存草稿 | saveDraft(draft_id) | MCP save_draft 成功 + status=SAVED |
-| D3.2 | 导出草稿 | exportDraft(draft_id) | 生成 draft_content.json + draft_meta_info.json + status=EXPORTED |
-| D3.3 | 版本自增 | 连续导出两次 | version_number 为 1, 2 |
-| D4.1 | 版本回滚 | rollbackVersion(draft_id, 1) | 草稿恢复到 v1 状态 |
-| D5.1 | 草稿列表（全部） | listDrafts({}) | 返回所有草稿含统计 |
-| D5.2 | 按状态过滤 | listDrafts({ status: 'EXPORTED' }) | 只返回已导出的草稿 |
-| D5.3 | 关键词搜索 | listDrafts({ keyword: "生日" }) | 返回匹配的草稿 |
-| D5.4 | 排序 | listDrafts({ sort: 'updated_at', sortOrder: 'desc' }) | 按更新时间倒序 |
-| D6.1 | 删除草稿 | deleteDraft(draft_id) | 级联删除 materials + versions + MCP delete |
-| D7.1 | 状态转换（正常） | EMPTY → EDITING → SAVED → EXPORTED | 每步转换正确 |
-| D7.2 | 状态转换（非法） | EMPTY → SAVED 直接跳转 | 抛出状态错误 |
-| D7.3 | 重新编辑 | EXPORTED → EDITING（添加新素材） | 状态正确回退 |
+| D1.1 | 创建草稿 | createDraft({ name: "test", width: 1920, height: 1080 }) | draft_main + 默认 3 轨道 + status=EMPTY |
+| D1.2 | 创建草稿（MCP 失败） | MCP Server 未启动时创建 | status=ERROR + error_message 记录 |
+| D2.1 | 添加视频 | addMaterial(draft_id, 'video', [{ url: "file:///E:/test.mp4" }]) | draft_materials + draft_tracks(video) + video_count=1 + EDITING |
+| D2.2 | 添加音频 | addMaterial(draft_id, 'audio', [{ url: "file:///E:/test.mp3" }]) | draft_materials + audio_count=1 |
+| D2.3 | 添加文本 | addMaterial(draft_id, 'text', [{ content: "Hello" }]) | draft_materials + text_count=1 |
+| D2.4 | 添加贴纸 | addMaterial(draft_id, 'sticker', [{ resource_id: "xxx" }]) | draft_materials + sticker_count=1 |
+| D2.5 | 添加图片 | addMaterial(draft_id, 'image', [{ url: "file:///E:/test.png" }]) | draft_materials + image_count=1 |
+| D2.6 | 批量添加 | addMaterial(draft_id, 'video', [url1, url2, url3]) | 3 条记录，sort_order = 1, 2, 3 |
+| D3.1 | 移除素材 | removeMaterial(draft_id, material_id) | video_count-- + segment_count-- + status=DIRTY |
+| D3.2 | 裁剪片段 | trimSegment(draft_id, material_id, { source_start: 1000000, source_end: 5000000 }) | source_start/end 更新 + DIRTY |
+| D3.3 | 重排序 | reorderSegments(draft_id, track_id, [3, 1, 2]) | sort_order 更新 + DIRTY |
+| D4.1 | 保存草稿 | saveDraft(draft_id) | MCP save + 本地 snapshot.json + status=SAVED |
+| D4.2 | 导出草稿 | exportDraft(draft_id) | draft_content.json + thumbnail + version=1 + EXPORTED |
+| D4.3 | 版本自增 | 连续导出两次 | version_number 为 1, 2 |
+| D5.1 | 版本回滚（正常） | rollbackVersion(draft_id, 1) | 草稿恢复到 v1 + missingMaterials=[] |
+| D5.2 | 版本回滚（素材缺失） | v1 引用的素材已删除 | missingMaterials=[id1, id2] 警告 |
+| D6.1 | MCP 恢复 | MCP 重启后 recoverDraft(draft_id) | 新 mcp_draft_id + 状态恢复为 EDITING |
+| D6.2 | MCP 恢复（无快照） | snapshot_path 不存在 | 返回错误，需手动重建 |
+| D7.1 | 草稿列表（全部） | listDrafts({}) | 返回所有草稿含统计 |
+| D7.2 | 按状态过滤 | listDrafts({ status: 'EXPORTED' }) | 只返回已导出的草稿 |
+| D7.3 | FTS5 搜索 | listDrafts({ keyword: "生日" }) | FTS5 搜索 name+description |
+| D7.4 | 排序 | listDrafts({ sort: 'updated_at', sortOrder: 'desc' }) | 按更新时间倒序 |
+| D8.1 | 软删除 | deleteDraft(draft_id) | status=ARCHIVED |
+| D8.2 | 硬删除 | deleteDraft(draft_id, true) | CASCADE 删除 + MCP delete + 文件清理 |
+| D9.1 | 状态转换（正常） | EMPTY → EDITING → DIRTY → SAVED → EXPORTED | 每步转换正确 |
+| D9.2 | 状态转换（非法） | EMPTY → SAVED 直接跳转 | 抛出 DraftStatusError |
+| D9.3 | 重新编辑 | EXPORTED → addMaterial → DIRTY | DIRTY 状态正确 |
+| D9.4 | ERROR 恢复 | ERROR → retry saveDraft → SAVED | 从错误恢复 |
+| D10.1 | 草稿复制 | duplicateDraft(draft_id, "copy") | 新 draft_id + 相同轨道和素材 |
+| D10.2 | 元数据更新 | updateDraft(draft_id, { name: "new name" }) | name 更新 |
+| D10.3 | 轨道静音 | muteTrack(track_id, true) | mute=1 + MCP 同步 |
 
-**验收标准**：能生成可被剪映打开的 draft_content.json
+**验收标准**：
+1. 能生成可被剪映打开的 draft_content.json
+2. MCP 断线后可通过本地快照恢复
+3. 反规范化计数与实际素材数一致
+4. 版本回滚时检测缺失素材并警告
 
 ---
 
-#### Phase 3.4 QueryEngine（13 tasks）
+#### Phase 3.4 QueryEngine（20 tasks）
 
-> **设计决策汇总**（2026-04-15 深度讨论确认）：
+> **设计决策汇总**（2026-04-16 深度分析修订）：
 >
 > | 决策维度 | 方案 |
 > |----------|------|
-> | 对话循环 | 方案A：ReAct 循环（AI 自主决定调 Tool 还是回复用户） |
-> | 意图识别 | 方案A：LLM Function Calling（Tool 注册为 functions，意图+选择一步完成） |
-> | 上下文管理 | 4 层渐进管道（Microcompact → SessionMemory → Autocompact → Reactive） |
-> | 消息结构 | Claude Code 同款：内部 Anthropic content blocks + API 适配层转 OpenAI 格式 |
-> | 流式响应 | 方案A：文本流式 + Tool 整体（参数积累完再执行） |
-> | Tool 编排 | 方案C：混合模式（独立操作可并行，有依赖的按顺序） |
-> | REPL | 方案A：完整 REPL（ChatWindow + PromptInput + StatusBar + 虚拟滚动） |
-> | 错误处理 | 方案A：简单重试（显示错误信息，用户决定是否重试） |
-> | System Prompt | 方案A：动态构建（每次 API 调用时组装） |
+> | 对话循环 | ReAct 循环 + 完整终止条件（completed/aborted/max_turns/budget_exceeded/error） |
+> | 意图识别 | LLM Function Calling（Tool 注册为 functions，意图+选择一步完成） |
+> | 上下文管理 | 4 层渐进管道完整实现（Microcompact → SessionMemory → Autocompact → **Reactive Compact**） |
+> | 消息结构 | Claude Code 同款：内部 content blocks + API 适配层转 OpenAI 格式 |
+> | 流式响应 | 文本流式 + **Streaming Tool Execution**（工具边流边执行，并发安全） |
+> | Tool 编排 | 混合模式（concurrency-safe 并行，非安全串行）+ per-tool AbortController |
+> | 错误恢复 | 4 层恢复：Withholding → Context Collapse → Reactive Compact → Fallback Model |
+> | 会话持久化 | JSONL 格式，支持 session 恢复 + parent UUID 链 |
+> | Multi-Agent | AgentTool 集成：独立 tool pool + permission context + depth tracking |
+> | System Prompt | 动态构建 + tool JSON Schema + JY 域知识 + 记忆上下文 |
+> | REPL | 完整 REPL（ChatWindow + PromptInput + StatusBar + PermissionDialog + VirtualScroll + Progress） |
+> | Token Budget | 按 model 动态管理（available = model_max - system_prompt - response_reserve） |
+> | Abort 机制 | 层级 AbortController（parent → child → per-tool），WeakRef 防泄漏 |
 
-##### 3.4.1 消息结构
+##### 3.4.1 消息结构与核心类型
 
-参考 Claude Code `src/types/message.ts`，内部采用 Anthropic content blocks 格式：
+参考 Claude Code `src/types/message.ts`，内部采用 content blocks 格式：
 
 ```typescript
 // types/message.ts
@@ -2217,8 +2980,7 @@ export type ContentBlockType =
   | 'text'
   | 'tool_use'      // assistant 输出的 tool_call
   | 'tool_result'   // tool 执行结果
-  | 'thinking'      // 思考过程（部分模型支持）
-  | 'image'         // 图片内容
+  | 'image'         // 图片内容（用户上传素材图片）
 
 /** Text Block */
 export interface TextBlock {
@@ -2226,10 +2988,20 @@ export interface TextBlock {
   text: string
 }
 
+/** Image Block（用户上传图片） */
+export interface ImageBlock {
+  type: 'image'
+  source: {
+    type: 'base64'
+    media_type: 'image/png' | 'image/jpeg' | 'image/webp'
+    data: string  // base64
+  }
+}
+
 /** Tool Use Block（assistant 消息中的 tool_call） */
 export interface ToolUseBlock {
   type: 'tool_use'
-  id: string           // 唯一 ID，用于关联 tool_result
+  id: string           // UUID v4
   name: string         // Tool 名称，如 'add_videos'
   input: Record<string, unknown>  // Tool 输入参数
 }
@@ -2237,22 +3009,27 @@ export interface ToolUseBlock {
 /** Tool Result Block */
 export interface ToolResultBlock {
   type: 'tool_result'
-  tool_use_id: string  // 关联的 tool_use ID
-  content: string      // 执行结果（成功时）或错误信息（失败时）
+  tool_use_id: string
+  content: string
   is_error?: boolean
 }
 
+export type ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock | ImageBlock
+
 /** 内部消息格式 */
 export interface ConversationMessage {
-  id: string
+  id: string                // UUID v4
   role: Role
-  content: ContentBlock[]  // content blocks 数组（非 string）
-  name?: string           // 用于 tool 消息的 tool_name
+  content: ContentBlock[]   // content blocks 数组（非 string）
+  name?: string             // tool 消息的 tool_name
   timestamp: number
+  parentUuid?: string       // 用于 JSONL 持久化的 UUID 链
   metadata?: {
-    denied?: boolean       // 权限拒绝标记
-    toolName?: string     // tool 角色时的 tool 名称
-    finishReason?: string  // assistant 的 finish_reason
+    denied?: boolean
+    toolName?: string
+    finishReason?: string
+    isMeta?: boolean        // 系统元消息（compaction summary 等）
+    isApiErrorMessage?: boolean
   }
 }
 
@@ -2268,28 +3045,69 @@ export interface ApiMessage {
 export interface ApiToolCall {
   id: string
   type: 'function'
-  function: {
-    name: string
-    arguments: string  // JSON 字符串
-  }
+  function: { name: string; arguments: string }
+}
+
+// ---- Agentic Loop 核心类型 ----
+
+/** 循环终止原因 */
+export type LoopExitReason =
+  | 'completed'             // AI 正常回复，无 tool_use
+  | 'aborted_streaming'     // 用户中断（流式阶段）
+  | 'aborted_tools'         // 用户中断（tool 执行阶段）
+  | 'prompt_too_long'       // 上下文溢出（所有恢复手段都失败）
+  | 'max_turns'             // 达到最大 turn 限制
+  | 'budget_exceeded'       // Token budget 耗尽
+  | 'model_error'           // API 错误（无 fallback 可用）
+  | 'stop_hook_prevented'   // Stop hook 阻止继续
+
+/** Loop 返回值 */
+export interface LoopResult {
+  reason: LoopExitReason
+  totalTurns: number
+  totalTokens: { input: number; output: number }
+  totalCost: number
+}
+
+/** 模型配置（per-model token limits） */
+export interface ModelConfig {
+  id: string                // 'glm-4-flash', 'minimax-01', etc.
+  maxContextTokens: number  // 模型上下文窗口
+  maxOutputTokens: number   // 单次最大输出
+  inputCostPer1k: number    // 每 1k token 输入费用
+  outputCostPer1k: number   // 每 1k token 输出费用
+}
+
+export const MODEL_CONFIGS: Record<string, ModelConfig> = {
+  'glm-4-flash':    { id: 'glm-4-flash',    maxContextTokens: 128000, maxOutputTokens: 4096,  inputCostPer1k: 0.0001, outputCostPer1k: 0.0001 },
+  'minimax-01':     { id: 'minimax-01',     maxContextTokens: 32000,  maxOutputTokens: 4096,  inputCostPer1k: 0.001,  outputCostPer1k: 0.001 },
+  'qwen-plus':      { id: 'qwen-plus',      maxContextTokens: 131072, maxOutputTokens: 8192,  inputCostPerPer1k: 0.002, outputCostPer1k: 0.006 },
+}
+
+/** Agentic Loop 配置 */
+export interface LoopConfig {
+  maxTurns: number          // 默认 50
+  abortController: AbortController
+  budgetLimit?: number      // Token budget 上限（可选）
+  model: string
+  fallbackModel?: string    // 备选模型
 }
 ```
 
-**与 Claude Code 的差异**：JY Draft 不需要支持 `thinking` block（思考过程），但需要支持 `image` block（用户上传素材图片）。
-
 ##### 3.4.2 API 适配层
 
-参考 Claude Code `src/services/api/openai/`，将内部 Anthropic 格式转换为目标 API 格式：
+参考 Claude Code `src/services/api/openai/`，将内部格式转换为目标 API 格式：
 
 ```typescript
 // core/queryEngine/apiAdapter.ts
 
 /**
  * 内部消息 → API 格式
- * 核心转换规则：
- * - tool_use block → tool_calls array（OpenAI 格式）
- * - tool_result block → tool message（role: 'tool'）
- * - content blocks 数组 → 合并为 string 或保持 array
+ * 转换规则：
+ * - tool_use block → tool_calls[] (OpenAI 格式)
+ * - tool_result block → tool message (role: 'tool')
+ * - image block → OpenAI vision 格式 (content: [{type:"image_url",...}])
+ * - 合并相邻同 role 消息（部分 API 要求）
  */
 export function toApiFormat(messages: ConversationMessage[]): ApiMessage[] {
   const result: ApiMessage[] = []
@@ -2301,60 +3119,107 @@ export function toApiFormat(messages: ConversationMessage[]): ApiMessage[] {
       for (const block of msg.content) {
         if (block.type === 'tool_use') {
           toolCalls.push({
-            id: block.id,
-            type: 'function',
+            id: block.id, type: 'function',
             function: {
               name: block.name,
-              arguments: typeof block.input === 'string'
-                ? block.input
-                : JSON.stringify(block.input),
+              arguments: typeof block.input === 'string' ? block.input : JSON.stringify(block.input),
             },
           })
         } else if (block.type === 'text') {
           textParts.push(block.text)
         }
       }
-
       result.push({
         role: 'assistant',
         content: textParts.join('') || null,
         tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
       })
+
     } else if (msg.role === 'tool') {
       const content = Array.isArray(msg.content)
-        ? msg.content.map(b => b.type === 'text' ? b.text : '').join('')
+        ? msg.content.map(b => b.type === 'text' ? b.text : b.type === 'tool_result' ? b.content : '').join('')
         : (typeof msg.content === 'string' ? msg.content : '')
+      result.push({ role: 'tool', tool_call_id: msg.metadata?.toolUseId, content })
 
-      result.push({
-        role: 'tool',
-        tool_call_id: msg.metadata?.toolUseId,
-        content,
-      })
-    } else if (msg.role === 'user' || msg.role === 'system') {
+    } else if (msg.role === 'user') {
+      // 处理 image block（OpenAI Vision 格式）
+      const contentParts: Array<{ type: string; text?: string; image_url?: { url: string } }> = []
+      if (Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block.type === 'text') contentParts.push({ type: 'text', text: block.text })
+          else if (block.type === 'image') {
+            contentParts.push({
+              type: 'image_url',
+              image_url: { url: `data:${block.source.media_type};base64,${block.source.data}` },
+            })
+          }
+        }
+      } else {
+        contentParts.push({ type: 'text', text: String(msg.content) })
+      }
+      result.push({ role: 'user', content: JSON.stringify(contentParts) })
+
+    } else if (msg.role === 'system') {
       const content = Array.isArray(msg.content)
         ? msg.content.map(b => b.type === 'text' ? b.text : '').join('')
         : (typeof msg.content === 'string' ? msg.content : '')
-
-      result.push({ role: msg.role, content })
+      result.push({ role: 'system', content })
     }
   }
   return result
 }
 
-/**
- * API 响应 → 内部格式
- * 核心转换规则：
- * - tool_calls → tool_use blocks
- * - delta 增量 → 合并到已有 block
- */
-export function fromApiFormat(response: ApiResponse): ConversationMessage[] {
-  // 见 stream.ts 的流式转换逻辑
+/** 流式 delta → 内部 block 累积 */
+export class StreamingAccumulator {
+  private blocks: ContentBlock[] = []
+  private currentText = ''
+  private currentToolUse: { id: string; name: string; args: string } | null = null
+
+  /** 处理 streaming chunk delta */
+  pushDelta(delta: { content?: string; tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }> }): void {
+    if (delta.content) this.currentText += delta.content
+    if (delta.tool_calls) {
+      for (const tc of delta.tool_calls) {
+        if (tc.id && tc.function?.name) {
+          this.flushToolUse()
+          this.currentToolUse = { id: tc.id, name: tc.function.name, args: '' }
+        }
+        if (tc.function?.arguments && this.currentToolUse) {
+          this.currentToolUse.args += tc.function.arguments
+        }
+      }
+    }
+  }
+
+  /** 获取完整 assistant 消息 */
+  finalize(): ConversationMessage {
+    this.flushToolUse()
+    const content: ContentBlock[] = []
+    if (this.currentText) content.push({ type: 'text', text: this.currentText })
+    content.push(...this.blocks)
+    return {
+      id: crypto.randomUUID(), role: 'assistant',
+      content, timestamp: Date.now(),
+      metadata: { finishReason: 'stop' },
+    }
+  }
+
+  private flushToolUse(): void {
+    if (!this.currentToolUse) return
+    let input: Record<string, unknown> = {}
+    try { input = JSON.parse(this.currentToolUse.args) } catch {}
+    this.blocks.push({
+      type: 'tool_use', id: this.currentToolUse.id,
+      name: this.currentToolUse.name, input,
+    })
+    this.currentToolUse = null
+  }
 }
 ```
 
 ##### 3.4.3 System Prompt 动态构建
 
-参考 Claude Code `src/context.ts`，每次 API 调用时动态组装 System Prompt：
+参考 Claude Code `src/context.ts`，每次 API 调用时动态组装：
 
 ```typescript
 // core/queryEngine/systemPrompt.ts
@@ -2364,170 +3229,217 @@ export interface SystemPromptContext {
   currentDraft?: { id: string; name: string; status: DraftStatus; stats: DraftStats }
   availableTools: ToolDefinition[]
   language: 'zh' | 'en'
+  currentDate: string               // '2026-04-16'
+  memoryContext?: string             // 从记忆系统加载的上下文
+  userPreferences?: string           // 用户偏好摘要
 }
 
 export function buildSystemPrompt(ctx: SystemPromptContext): string {
   const parts: string[] = []
 
-  // 角色定义
-  parts.push(`你是 JY Draft 的 AI 助手，可以通过自然语言帮助用户创建和编辑剪映草稿。`)
+  // 1. 角色定义
+  parts.push(`你是 JY Draft 的 AI 助手，帮助用户通过自然语言创建和编辑剪映（JianYing）视频草稿。`)
   parts.push(`当前语言：${ctx.language === 'zh' ? '中文' : 'English'}`)
+  parts.push(`当前日期：${ctx.currentDate}`)
 
-  // 当前草稿状态
+  // 2. JY Draft 域知识
+  parts.push(`\n## 剪映草稿知识\n`)
+  parts.push(`- 时间单位：微秒（1秒 = 1,000,000 微秒）`)
+  parts.push(`- 轨道类型：video / audio / text / sticker / effect / filter`)
+  parts.push(`- 草稿状态：EMPTY → EDITING → DIRTY → SAVED → EXPORTED`)
+  parts.push(`- 素材引用：通过 material_url（file:///）引用本地文件`)
+  parts.push(`- 导出产物：draft_content.json（剪映可直接打开）`)
+
+  // 3. 当前草稿状态
   if (ctx.currentDraft) {
-    parts.push(`当前草稿：「${ctx.currentDraft.name}」（${ctx.currentDraft.status}）`)
-    parts.push(`素材统计：视频${ctx.currentDraft.stats.videoCount}个，音频${ctx.currentDraft.stats.audioCount}个，文本${ctx.currentDraft.stats.textCount}个`)
+    parts.push(`\n## 当前草稿\n`)
+    parts.push(`- 名称：「${ctx.currentDraft.name}」`)
+    parts.push(`- 状态：${ctx.currentDraft.status}`)
+    parts.push(`- 尺寸：${ctx.currentDraft.stats.width || 1920}x${ctx.currentDraft.stats.height || 1080}`)
+    parts.push(`- 素材：视频${ctx.currentDraft.stats.videoCount}个，音频${ctx.currentDraft.stats.audioCount}个，文本${ctx.currentDraft.stats.textCount}个`)
+    parts.push(`- 总时长：${Math.round((ctx.currentDraft.stats.totalDuration || 0) / 1000000)}秒`)
   }
 
-  // 可用工具（注册为 functions）
-  if (ctx.availableTools.length > 0) {
-    parts.push(`\n## 可用工具\n`)
-    for (const tool of ctx.availableTools) {
-      parts.push(`- ${tool.name}: ${tool.description}`)
-    }
+  // 4. 记忆上下文
+  if (ctx.memoryContext) {
+    parts.push(`\n## 记忆上下文\n${ctx.memoryContext}`)
   }
 
-  // 约束
+  // 5. 用户偏好
+  if (ctx.userPreferences) {
+    parts.push(`\n## 用户偏好\n${ctx.userPreferences}`)
+  }
+
+  // 6. 约束
   parts.push(`\n## 约束\n`)
-  parts.push(`- 敏感操作（如删除文件、访问特定目录）需要用户确认`)
-  parts.push(`- 如果权限被拒绝，告知用户原因并提供解决建议`)
-  parts.push(`- 所有文件路径使用 Windows 格式，如 E:\\videos\\test.mp4`)
+  parts.push(`- 敏感操作（删除、覆盖）需要用户确认`)
+  parts.push(`- 权限被拒绝时，告知原因并提供替代建议`)
+  parts.push(`- 文件路径使用 Windows 格式：E:\\videos\\test.mp4`)
+  parts.push(`- 修改草稿后记得保存（save_draft）`)
+  parts.push(`- 如果操作失败，尝试恢复或告知用户具体错误`)
 
   return parts.join('\n')
 }
 
-/** 工具注册为 functions schema */
+/** 工具注册为 functions schema（含完整 JSON Schema） */
 export function toolsToFunctions(tools: ToolDefinition[]): FunctionDefinition[] {
   return tools.map(tool => ({
     name: tool.name,
     description: tool.description,
-    parameters: tool.parameters,  // JSON Schema
+    parameters: tool.parameters,  // 完整 JSON Schema，非仅名称
   }))
 }
 ```
 
-##### 3.4.4 对话上下文与 4 层 Compaction
+##### 3.4.4 对话上下文与 4 层 Compaction（完整实现）
 
-参考 Claude Code 的 4 层渐进管道（Microcompact → SessionMemory → Autocompact → Reactive）：
+参考 Claude Code 的 4 层渐进管道 + Reactive Compact：
 
 ```typescript
 // core/queryEngine/context.ts
 
 const CONTEXT_THRESHOLDS = {
-  BUDGET_WARN: 0.9,     // 90%: Budget 警告
-  SNIP: 0.95,           // 95%: 简单截断
-  MICRO: 0.98,          // 98%: Microcompact
-  SESSION: 0.99,        // 99%: SessionMemory
-  AUTO: 1.0,            // ~100%: Autocompact
-}
-
-export interface ConversationContext {
-  messages: ConversationMessage[]
-  systemPrompt: string
-  totalTokens: number
-  maxTokens: number
+  BUDGET_WARN: 0.8,     // 80%: Budget 警告（通知前端）
+  SNIP: 0.9,            // 90%: 简单截断最旧消息
+  MICRO: 0.93,          // 93%: Microcompact
+  SESSION: 0.96,        // 96%: SessionMemory
+  AUTO: 0.98,           // 98%: Autocompact
+  REACTIVE: 1.0,        // 100%+: Reactive Compact（API 错误触发）
 }
 
 export class ConversationManager {
   private messages: ConversationMessage[] = []
-  private sessionMemoryDir: string  // 如 .jy-draft/sessions/{id}/memory/
+  private sessionMemoryDir: string
+  private modelConfig: ModelConfig
+  private responseReserve = 4096  // 为 response 预留的 token 数
 
-  async addMessage(msg: ConversationMessage): Promise<void> {
-    this.messages.push(msg)
-    await this.checkAndCompact()
+  constructor(config: { modelConfig: ModelConfig; sessionDir: string }) {
+    this.modelConfig = config.modelConfig
+    this.sessionMemoryDir = path.join(config.sessionDir, 'memory')
   }
 
-  /** Token 计数（简化版，实际用 tiktoken 或类似库） */
-  private async countTokens(msgs: ConversationMessage[]): Promise<number> {
-    const totalChars = msgs.reduce((sum, m) => sum + JSON.stringify(m).length, 0)
-    return Math.ceil(totalChars * 0.25)
+  /** 可用 token = 模型上限 - system_prompt - response 预留 */
+  get availableTokens(): number {
+    const used = this.countTokens(this.messages)
+    return this.modelConfig.maxContextTokens - this.responseReserve - used
+  }
+
+  get tokenRatio(): number {
+    const used = this.countTokens(this.messages)
+    return used / (this.modelConfig.maxContextTokens - this.responseReserve)
+  }
+
+  /** Token 计数（使用 tiktoken-wasm 或 js-tiktoken） */
+  private countTokens(msgs: ConversationMessage[]): number {
+    // 生产环境使用 tiktoken；开发阶段可用 JSON.stringify 长度估算
+    const text = msgs.map(m => JSON.stringify(m)).join('')
+    return Math.ceil(text.length * 0.3)  // 占位，替换为实际 tokenizer
   }
 
   /** 检查是否需要 compaction */
-  private async checkAndCompact(): Promise<void> {
-    const ratio = this.totalTokens / this.maxTokens
-
-    if (ratio >= CONTEXT_THRESHOLDS.AUTO) {
-      await this.autocompact()
-    } else if (ratio >= CONTEXT_THRESHOLDS.SESSION) {
-      await this.sessionMemory()
-    } else if (ratio >= CONTEXT_THRESHOLDS.MICRO) {
-      await this.microcompact()
-    }
+  async checkAndCompact(): Promise<void> {
+    const ratio = this.tokenRatio
+    if (ratio >= CONTEXT_THRESHOLDS.AUTO)      await this.autocompact()
+    else if (ratio >= CONTEXT_THRESHOLDS.SESSION) await this.sessionMemory()
+    else if (ratio >= CONTEXT_THRESHOLDS.MICRO)   await this.microcompact()
+    else if (ratio >= CONTEXT_THRESHOLDS.SNIP)    await this.snip()
   }
 
-  /** Microcompact：单条 tool_result 原地替换为 placeholder */
+  /** L0: 简单截断最旧的 non-system 消息 */
+  private async snip(): Promise<void> {
+    const target = this.messages.length - 10  // 保留最近 10 条
+    const systemMsgs = this.messages.filter(m => m.role === 'system' || m.metadata?.isMeta)
+    const otherMsgs = this.messages.filter(m => m.role !== 'system' && !m.metadata?.isMeta)
+    const removed = otherMsgs.slice(0, otherMsgs.length - target)
+    this.messages = [
+      ...systemMsgs,
+      { id: crypto.randomUUID(), role: 'system', content: [{ type: 'text', text: `[snip] 已移除 ${removed.length} 条旧消息` }], timestamp: Date.now(), metadata: { isMeta: true } },
+      ...otherMsgs.slice(-target),
+    ]
+  }
+
+  /** L1: Microcompact — 长 tool_result 原地替换为摘要 */
   private async microcompact(): Promise<void> {
     for (let i = 0; i < this.messages.length; i++) {
       const msg = this.messages[i]
-      if (msg.role === 'tool' && typeof msg.content === 'string' && msg.content.length > 500) {
-        const chars = msg.content.length
-        msg.content = `[tool_result: ${msg.metadata?.toolName} — ${chars} chars, truncated]`
+      const contentStr = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
+      if (msg.role === 'tool' && contentStr.length > 500) {
+        const toolName = msg.metadata?.toolName || 'unknown'
+        const summary = contentStr.slice(0, 200) + `... [${toolName}: ${contentStr.length} chars → truncated]`
+        msg.content = [{ type: 'text', text: summary }]
       }
     }
   }
 
-  /** SessionMemory：批量 tool_result 提取到外部文件 */
+  /** L2: SessionMemory — 批量 tool_result 提取到外部文件 */
   private async sessionMemory(): Promise<void> {
     const toExtract: number[] = []
-    let extractStart: number | null = null
-
-    for (let i = 0; i < this.messages.length; i++) {
-      const msg = this.messages[i]
-      if (msg.role === 'tool') {
-        if (extractStart === null) extractStart = i
-        toExtract.push(i)
-      } else if (msg.role === 'assistant' && extractStart !== null) {
-        break
-      }
+    for (let i = 0; i < this.messages.length - 5; i++) {  // 不提取最近 5 条
+      if (this.messages[i].role === 'tool') toExtract.push(i)
     }
-
     if (toExtract.length === 0) return
 
     const memoryFile = path.join(this.sessionMemoryDir, `${Date.now()}.json`)
-    const originals = toExtract.map(i => ({ index: i, message: this.messages[i] }))
+    const originals = toExtract.map(i => this.messages[i])
+    await fs.mkdir(this.sessionMemoryDir, { recursive: true })
     await writeFile(memoryFile, JSON.stringify(originals, null, 2))
 
-    const summary = `已提取 ${toExtract.length} 条 tool_results 到外部存储: ${memoryFile}`
     this.messages = this.messages.filter((_, i) => !toExtract.includes(i))
     this.messages.push({
-      id: generateId(),
-      role: 'system',
-      content: [{ type: 'text', text: `[SessionMemory] ${summary}` }],
-      timestamp: Date.now(),
-      isMeta: true,
+      id: crypto.randomUUID(), role: 'system',
+      content: [{ type: 'text', text: `[SessionMemory] ${originals.length} 条 tool_result 已提取到外部存储` }],
+      timestamp: Date.now(), metadata: { isMeta: true },
     })
   }
 
-  /** Autocompact：LLM 摘要压缩 */
-  private async autocompact(): Promise<void> {
-    const summary = await this.llmSummarize(this.messages)
-
+  /** L3: Autocompact — LLM 摘要压缩（调用 AI 生成摘要） */
+  async autocompact(apiClient: ApiClient, model: string): Promise<void> {
+    const toSummarize = this.messages.filter(m => m.role !== 'system' && !m.metadata?.isMeta)
     const keepCount = 5
-    const systemMessages = this.messages.filter(m => m.role === 'system')
+
+    const summaryPrompt = '请将以下对话历史压缩为简洁摘要，保留：用户意图、已执行操作、草稿当前状态、待办事项。'
+    const summary = await callLlmForSummary(apiClient, model, toSummarize, summaryPrompt)
+
+    const systemMessages = this.messages.filter(m => m.role === 'system' || m.metadata?.isMeta)
     const recentMessages = this.messages.slice(-keepCount)
 
     this.messages = [
       ...systemMessages,
-      {
-        id: generateId(),
-        role: 'system',
+      { id: crypto.randomUUID(), role: 'system',
         content: [{ type: 'text', text: `[对话摘要] ${summary}` }],
-        timestamp: Date.now(),
-        isMeta: true,
-      },
+        timestamp: Date.now(), metadata: { isMeta: true } },
       ...recentMessages,
     ]
+  }
+
+  /** L4: Reactive Compact — API 错误触发（prompt_too_long / media_size） */
+  async reactiveCompact(error: ApiError, apiClient: ApiClient, model: string): Promise<boolean> {
+    if (error.type === 'prompt_too_long') {
+      // 先尝试 autocompact
+      await this.autocompact(apiClient, model)
+      return this.tokenRatio < 0.9  // 压缩后仍超限则失败
+    }
+    if (error.type === 'media_size') {
+      // 移除最大的 image block
+      this.messages = this.messages.map(m => ({
+        ...m,
+        content: Array.isArray(m.content)
+          ? m.content.filter(b => b.type !== 'image')
+          : m.content,
+      }))
+      return true
+    }
+    return false
   }
 }
 ```
 
 **preservePriority（压缩优先级）**：
-1. Plan（计划相关内容）最高
-2. 近期 assistant 消息（保持连贯性）
-3. tool_result（工具执行结果）
-4. 用户意图（用户原始请求）
-5. 其他文本
+1. **Plan 相关**（最高，不可丢弃）
+2. **System prompt + 摘要消息**（isMeta=true）
+3. **最近 5 条消息**（保持连贯性）
+4. **User 原始意图**（优先保留 user 消息）
+5. **tool_result**（最优先压缩/提取）
 
 ##### 3.4.5 Tool 注册与定义
 
@@ -2540,6 +3452,7 @@ export interface ToolDefinition {
   parameters: JsonSchema  // JSON Schema for function calling
   handler: ToolHandler
   permission?: PermissionLevel
+  isReadOnly?: (input: Record<string, unknown>) => boolean  // 判断是否为只读操作
 }
 
 export type ToolHandler = (
@@ -2551,29 +3464,49 @@ export interface ToolCallContext {
   draftId?: string
   userId: string
   mcpClient: McpClient
+  abortController: AbortController  // per-tool abort
+  toolRegistry: ToolRegistry        // 引用所在 registry（支持子 Agent 独立池）
 }
 
-/** 工具注册表（MCP Tool + 本地 Tool） */
-export const toolRegistry = new Map<string, ToolDefinition>()
+/** Tool Registry（per-engine 实例，支持 Multi-Agent 独立 tool pool） */
+export class ToolRegistry {
+  private tools = new Map<string, ToolDefinition>()
 
-/** 注册 MCP Tool */
-export function registerMcpTool(mcpTool: McpToolSpec): void {
-  toolRegistry.set(mcpTool.name, {
-    name: mcpTool.name,
-    description: mcpTool.description,
-    parameters: mcpTool.inputSchema,
-    handler: async (input, ctx) => {
-      const result = await ctx.mcpClient.callTool(mcpTool.name, input)
-      return { success: true, content: JSON.stringify(result) }
-    },
-  })
-}
+  register(tool: ToolDefinition): void {
+    this.tools.set(tool.name, tool)
+  }
 
-/** 注册本地 Tool（如状态查询、上下文构建） */
-export function registerLocalTool(def: Omit<ToolDefinition, 'handler'> & {
-  handler: (input: Record<string, unknown>, ctx: ToolCallContext) => Promise<ToolResult>
-}): void {
-  toolRegistry.set(def.name, def)
+  get(name: string): ToolDefinition | undefined {
+    return this.tools.get(name)
+  }
+
+  values(): IterableIterator<ToolDefinition> {
+    return this.tools.values()
+  }
+
+  /** 注册 MCP Tool */
+  registerMcpTool(mcpTool: McpToolSpec): void {
+    this.tools.set(mcpTool.name, {
+      name: mcpTool.name,
+      description: mcpTool.description,
+      parameters: mcpTool.inputSchema,
+      isReadOnly: () => mcpTool.name.startsWith('list_') || mcpTool.name.startsWith('get_'),
+      handler: async (input, ctx) => {
+        const result = await ctx.mcpClient.callTool(mcpTool.name, input)
+        return { success: true, content: JSON.stringify(result) }
+      },
+    })
+  }
+
+  /** 创建子集（供 Sub-Agent 使用） */
+  createSubset(toolNames: string[]): ToolRegistry {
+    const sub = new ToolRegistry()
+    for (const name of toolNames) {
+      const def = this.tools.get(name)
+      if (def) sub.register(def)
+    }
+    return sub
+  }
 }
 ```
 
@@ -2736,7 +3669,9 @@ function decideNextStrategy(reason: string): 'stop' | 'retry_without_tool' | 'su
 }
 ```
 
-##### 3.4.9 流式响应
+##### 3.4.9 流式响应与 Agentic Loop（完整实现）
+
+参考 Claude Code `query.ts` 的完整 agentic loop：
 
 ```typescript
 // core/queryEngine/stream.ts
@@ -2745,100 +3680,368 @@ export type StreamEvent =
   | { type: 'text'; delta: string }
   | { type: 'tool_call_start'; id: string; name: string }
   | { type: 'tool_call_args'; delta: string }
-  | { type: 'tool_call_end' }
-  | { type: 'tool_result'; id: string; content: string }
-  | { type: 'done' }
-  | { type: 'error'; error: string }
+  | { type: 'tool_call_end'; id: string }
+  | { type: 'tool_result'; id: string; content: string; is_error?: boolean }
+  | { type: 'tool_progress'; id: string; message: string }     // 长时间 tool 进度
+  | { type: 'context_compaction'; level: string }               // compaction 事件
+  | { type: 'model_switch'; from: string; to: string }          // 模型切换
+  | { type: 'budget_warning'; used: number; total: number }     // budget 警告
+  | { type: 'done'; result: LoopResult }
+  | { type: 'error'; error: string; recoverable: boolean }
 
-/** 流式执行 QueryEngine 主循环 */
+/** 流式执行 Agentic Loop 主循环 */
 export async function* streamQuery(
   userMessage: string,
   ctx: QueryContext
 ): AsyncGenerator<StreamEvent> {
-  const messages = ctx.conversationManager.getMessages()
+  const { conversationManager, loopConfig, apiClient, permissionGuard } = ctx
+  const messages = conversationManager.getMessages()
+  let currentModel = loopConfig.model
+  let turnCount = 0
+  let totalInputTokens = 0
+  let totalOutputTokens = 0
 
-  const systemPrompt = buildSystemPrompt(ctx.systemPromptContext)
-
-  const userMsg: ConversationMessage = {
-    id: generateId(),
-    role: 'user',
+  // 添加 user 消息
+  messages.push({
+    id: crypto.randomUUID(), role: 'user',
     content: [{ type: 'text', text: userMessage }],
     timestamp: Date.now(),
-  }
-  messages.push(userMsg)
-
-  let assistantMsg: ConversationMessage | null = null
+  })
 
   while (true) {
-    const apiMessages = toApiFormat([...messages])
-    const apiResponse = await ctx.apiClient.chat.completions.create({
-      model: ctx.model,
-      messages: [systemPrompt, ...apiMessages],
-      tools: toolsToFunctions([...toolRegistry.values()]),
-      stream: true,
-    })
+    turnCount++
 
-    let currentToolUse: ToolUseBlock | null = null
-    let textContent: string[] = []
+    // ---- 终止条件检查 ----
+    if (turnCount > loopConfig.maxTurns) {
+      yield { type: 'done', result: { reason: 'max_turns', totalTurns: turnCount, totalTokens: { input: totalInputTokens, output: totalOutputTokens }, totalCost: 0 } }
+      return
+    }
 
-    for await (const chunk of apiResponse) {
-      const delta = chunk.choices[0]?.delta
+    if (loopConfig.abortController.signal.aborted) {
+      // 为未完成的 tool 生成合成 result
+      yield { type: 'done', result: { reason: 'aborted_streaming', totalTurns: turnCount, totalTokens: { input: totalInputTokens, output: totalOutputTokens }, totalCost: 0 } }
+      return
+    }
 
-      if (delta.content) {
-        yield { type: 'text', delta: delta.content }
-        textContent.push(delta.content)
-      }
+    // ---- Budget 检查 ----
+    if (loopConfig.budgetLimit && totalInputTokens + totalOutputTokens > loopConfig.budgetLimit) {
+      yield { type: 'done', result: { reason: 'budget_exceeded', totalTurns: turnCount, totalTokens: { input: totalInputTokens, output: totalOutputTokens }, totalCost: 0 } }
+      return
+    }
 
-      if (delta.tool_calls) {
-        for (const tc of delta.tool_calls) {
-          if (tc.id && !currentToolUse) {
-            yield { type: 'tool_call_start', id: tc.id, name: tc.function.name }
-            currentToolUse = { type: 'tool_use', id: tc.id, name: tc.function.name, input: {} }
-          }
-          if (tc.function.arguments) {
-            yield { type: 'tool_call_args', delta: tc.function.arguments }
-            try {
-              currentToolUse.input = JSON.parse(tc.function.arguments)
-            } catch {
-              // partial JSON，继续累积
-            }
+    // ---- Compaction ----
+    try {
+      await conversationManager.checkAndCompact()
+    } catch {
+      // compaction 失败不阻塞，继续尝试
+    }
+
+    // ---- 构建 System Prompt ----
+    const systemPrompt = buildSystemPrompt(ctx.systemPromptContext)
+
+    // ---- API 调用（含错误恢复） ----
+    let assistantMsg: ConversationMessage
+    try {
+      const accumulator = new StreamingAccumulator()
+      const apiResponse = apiClient.chat.completions.create({
+        model: currentModel,
+        messages: [{ role: 'system', content: systemPrompt }, ...toApiFormat(messages)],
+        tools: toolsToFunctions([...ctx.toolRegistry.values()]),
+        stream: true,
+      })
+
+      for await (const chunk of apiResponse) {
+        // 检查 abort
+        if (loopConfig.abortController.signal.aborted) break
+
+        const delta = chunk.choices[0]?.delta
+        if (delta?.content) {
+          yield { type: 'text', delta: delta.content }
+        }
+        if (delta?.tool_calls) {
+          for (const tc of delta.tool_calls) {
+            if (tc.id) yield { type: 'tool_call_start', id: tc.id, name: tc.function?.name || '' }
+            if (tc.function?.arguments) yield { type: 'tool_call_args', delta: tc.function.arguments }
           }
         }
+        accumulator.pushDelta(delta || {})
+
+        // Token 统计
+        if (chunk.usage) {
+          totalInputTokens += chunk.usage.prompt_tokens || 0
+          totalOutputTokens += chunk.usage.completion_tokens || 0
+        }
       }
+      assistantMsg = accumulator.finalize()
+
+    } catch (apiError) {
+      // ---- 错误恢复 ----
+      const error = apiError as ApiError
+
+      // 尝试 Reactive Compact
+      if (error.type === 'prompt_too_long' || error.type === 'media_size') {
+        const recovered = await conversationManager.reactiveCompact(error, apiClient, currentModel)
+        if (recovered) {
+          yield { type: 'context_compaction', level: 'reactive' }
+          continue  // 重试
+        }
+      }
+
+      // 尝试 Fallback Model
+      if (loopConfig.fallbackModel && currentModel !== loopConfig.fallbackModel) {
+        yield { type: 'model_switch', from: currentModel, to: loopConfig.fallbackModel }
+        currentModel = loopConfig.fallbackModel
+        continue  // 用 fallback 重试
+      }
+
+      // 所有恢复失败
+      yield { type: 'error', error: error.message, recoverable: false }
+      yield { type: 'done', result: { reason: 'model_error', totalTurns: turnCount, totalTokens: { input: totalInputTokens, output: totalOutputTokens }, totalCost: 0 } }
+      return
     }
 
-    if (!assistantMsg) {
-      assistantMsg = {
-        id: generateId(),
-        role: 'assistant',
-        content: [{ type: 'text', text: textContent.join('') }],
-        timestamp: Date.now(),
-      }
-    }
-
+    // ---- 检查 tool_use ----
+    messages.push(assistantMsg)
     const toolUseBlocks = (assistantMsg.content as ContentBlock[])
       .filter((b): b is ToolUseBlock => b.type === 'tool_use')
 
     if (toolUseBlocks.length === 0) {
-      messages.push(assistantMsg)
-      yield { type: 'done' }
-      break
+      // 无 tool_use，正常结束
+      yield { type: 'done', result: { reason: 'completed', totalTurns: turnCount, totalTokens: { input: totalInputTokens, output: totalOutputTokens }, totalCost: 0 } }
+      return
     }
 
-    messages.push(assistantMsg)
-    const toolResults = await executeToolCallsParallel(toolUseBlocks, ctx, ctx.permissionGuard)
+    // ---- Streaming Tool Execution ----
+    const toolExecutor = new StreamingToolExecutor(ctx.toolRegistry, permissionGuard, loopConfig.abortController)
 
-    for (const tr of toolResults) {
-      messages.push({
-        id: generateId(),
-        role: 'tool',
-        content: [tr],
-        metadata: { toolUseId: tr.tool_use_id, toolName: tr.tool_use_id },
-        timestamp: Date.now(),
-      })
-      yield { type: 'tool_result', id: tr.tool_use_id, content: tr.content }
+    for (const block of toolUseBlocks) {
+      toolExecutor.addTool(block, assistantMsg)
+    }
+
+    // 收集结果
+    for await (const update of toolExecutor.getResults()) {
+      if (update.type === 'progress') {
+        yield { type: 'tool_progress', id: update.toolId, message: update.message }
+      } else if (update.type === 'result') {
+        messages.push({
+          id: crypto.randomUUID(), role: 'tool',
+          content: [update.result],
+          metadata: { toolUseId: update.result.tool_use_id, toolName: update.toolName },
+          timestamp: Date.now(),
+        })
+        yield { type: 'tool_result', id: update.result.tool_use_id, content: update.result.content, is_error: update.result.is_error }
+        yield { type: 'tool_call_end', id: update.result.tool_use_id }
+      }
+    }
+
+    // 继续循环（AI 将看到 tool_result 并决定下一步）
+  }
+}
+```
+
+##### 3.4.9a Streaming Tool Executor
+
+参考 Claude Code `StreamingToolExecutor`：
+
+```typescript
+// core/queryEngine/streamingToolExecutor.ts
+
+type ToolStatus = 'queued' | 'executing' | 'completed' | 'yielded'
+
+interface TrackedTool {
+  id: string
+  block: ToolUseBlock
+  status: ToolStatus
+  isConcurrencySafe: boolean  // 只读工具可并发
+  pendingProgress: string[]
+}
+
+export class StreamingToolExecutor {
+  private tools: TrackedTool[] = []
+  private toolRegistry: Map<string, ToolDefinition>
+  private permissionGuard: PermissionGuard
+  private abortController: AbortController
+
+  constructor(toolRegistry: Map<string, ToolDefinition>, guard: PermissionGuard, ac: AbortController) {
+    this.toolRegistry = toolRegistry
+    this.permissionGuard = guard
+    this.abortController = ac
+  }
+
+  addTool(block: ToolUseBlock, assistantMsg: ConversationMessage): void {
+    const def = this.toolRegistry.get(block.name)
+    this.tools.push({
+      id: block.id, block,
+      status: 'queued',
+      isConcurrencySafe: def?.isReadOnly?.(block.input) ?? false,
+      pendingProgress: [],
+    })
+    void this.processQueue()
+  }
+
+  /** 按依赖和并发安全规则执行 */
+  private async processQueue(): Promise<void> {
+    const queued = this.tools.filter(t => t.status === 'queued')
+    const safeTools = queued.filter(t => t.isConcurrencySafe)
+    const unsafeTools = queued.filter(t => !t.isConcurrencySafe)
+
+    // 并发安全的一起跑
+    await Promise.all(safeTools.map(t => this.executeOne(t)))
+    // 非安全的串行
+    for (const t of unsafeTools) {
+      if (this.abortController.signal.aborted) break
+      await this.executeOne(t)
     }
   }
+
+  private async executeOne(tool: TrackedTool): Promise<void> {
+    tool.status = 'executing'
+    try {
+      const result = await this.permissionGuard.checkAndExecute(
+        tool.block.name, tool.block.input,
+        async () => {
+          const handler = this.toolRegistry.get(tool.block.name)
+          if (!handler) throw new Error(`Tool ${tool.block.name} not found`)
+          return handler.handler(tool.block.input, this.buildToolContext())
+        }
+      )
+      tool.status = 'completed'
+      // result 将通过 getResults() yield
+    } catch (e) {
+      tool.status = 'completed'
+      // error result
+    }
+  }
+
+  /** 按顺序 yield 结果 */
+  async *getResults(): AsyncGenerator<{ type: 'progress' | 'result'; toolId: string; message?: string; result?: ToolResultBlock; toolName?: string }> {
+    for (const tool of this.tools) {
+      // 等待完成
+      while (tool.status !== 'completed') await new Promise(r => setTimeout(r, 50))
+
+      // yield pending progress
+      for (const msg of tool.pendingProgress) {
+        yield { type: 'progress', toolId: tool.id, message: msg }
+      }
+
+      // yield result
+      tool.status = 'yielded'
+    }
+  }
+
+  private buildToolContext(): ToolCallContext { /* ... */ }
+}
+```
+
+##### 3.4.9b 会话持久化（JSONL）
+
+参考 Claude Code 的 session 持久化：
+
+```typescript
+// core/queryEngine/sessionPersistence.ts
+
+export class SessionPersistence {
+  private sessionDir: string   // .jy-draft/sessions/{sessionId}/
+
+  constructor(sessionDir: string) {
+    this.sessionDir = sessionDir
+    fs.mkdirSync(sessionDir, { recursive: true })
+  }
+
+  /** 追加消息到 JSONL 文件 */
+  async appendMessage(sessionId: string, msg: ConversationMessage): Promise<void> {
+    const filePath = path.join(this.sessionDir, sessionId, 'transcript.jsonl')
+    const line = JSON.stringify({
+      type: msg.role,
+      id: msg.id,
+      parentUuid: msg.parentUuid,
+      content: msg.content,
+      metadata: msg.metadata,
+      timestamp: msg.timestamp,
+    })
+    await appendFile(filePath, line + '\n')
+  }
+
+  /** 恢复会话 */
+  async restoreSession(sessionId: string): Promise<ConversationMessage[]> {
+    const filePath = path.join(this.sessionDir, sessionId, 'transcript.jsonl')
+    if (!existsSync(filePath)) return []
+
+    const lines = (await readFile(filePath, 'utf-8')).split('\n').filter(Boolean)
+    return lines.map(line => {
+      const entry = JSON.parse(line)
+      return {
+        id: entry.id,
+        role: entry.type,
+        content: entry.content,
+        metadata: entry.metadata,
+        timestamp: entry.timestamp,
+        parentUuid: entry.parentUuid,
+      } as ConversationMessage
+    })
+  }
+
+  /** 列出所有会话 */
+  async listSessions(): Promise<Array<{ id: string; createdAt: number; messageCount: number }>> {
+    // 扫描 sessionDir 下的子目录
+  }
+
+  /** 清理旧会话（7天+） */
+  async cleanupOldSessions(maxAgeMs: number = 7 * 24 * 3600 * 1000): Promise<number> {
+    // ...
+  }
+}
+```
+
+##### 3.4.9c Multi-Agent 集成
+
+QueryEngine 通过 AgentTool 支持子 Agent 执行：
+
+```typescript
+// core/queryEngine/agentTool.ts（在 Tool Registry 中注册）
+
+export const agentToolDefinition: ToolDefinition = {
+  name: 'Agent',
+  description: '调用子 Agent 执行特定任务（草稿构建、素材分析等）',
+  parameters: {
+    type: 'object',
+    properties: {
+      prompt: { type: 'string', description: '子 Agent 的任务描述' },
+      subagent_type: {
+        type: 'string',
+        enum: ['DraftBuilder', 'MaterialAnalyst', 'ExploreAgent', 'AudioAgent'],
+        description: '子 Agent 类型',
+      },
+    },
+    required: ['prompt', 'subagent_type'],
+  },
+  handler: async (input, ctx) => {
+    const { prompt, subagent_type } = input as { prompt: string; subagent_type: string }
+
+    // 1. 获取 Agent 定义（独立 tool pool + permission mode）
+    const agentDef = AGENT_DEFINITIONS[subagent_type]
+
+    // 2. 构建独立 tool pool
+    const subToolPool = new Map<string, ToolDefinition>()
+    for (const toolName of agentDef.tools) {
+      const def = ctx.toolRegistry.get(toolName)
+      if (def) subToolPool.set(toolName, def)
+    }
+
+    // 3. 创建子 QueryEngine（独立 context + permission mode）
+    const subEngine = new SubQueryEngine({
+      toolPool: subToolPool,
+      permissionMode: agentDef.permissionMode,  // e.g., 'acceptEdits'
+      parentAbortController: ctx.abortController,
+      maxTurns: 20,
+      model: ctx.model,
+    })
+
+    // 4. 执行并返回结果
+    const result = await subEngine.run(prompt)
+    return { success: true, content: result }
+  },
+  isReadOnly: () => false,
 }
 ```
 
@@ -2908,11 +4111,24 @@ export class QueryEngine {
 // ipc/query.ts
 
 export const QUERY_IPC_CHANNELS = {
-  'query:send': (message: string) => Promise<ConversationMessage>,
-  'query:send-stream': (message: string) => void,
-  'query:get-history': () => Promise<ConversationMessage[]>,
-  'query:clear-history': () => Promise<void>,
-  'query:get-context': () => Promise<SystemPromptContext>,
+  // 消息
+  'query:send':         (message: string) => Promise<ConversationMessage>,
+  'query:send-stream':  (message: string) => void,    // → renderer receives stream events
+  'query:interrupt':    () => void,                     // 中断当前对话
+  'query:abort-tool':   (toolUseId: string) => void,   // 取消特定 tool 执行
+
+  // 会话
+  'query:get-history':    () => Promise<ConversationMessage[]>,
+  'query:clear-history':  () => Promise<void>,
+  'query:list-sessions':  () => Promise<SessionInfo[]>,
+  'query:restore-session': (sessionId: string) => Promise<ConversationMessage[]>,
+  'query:delete-session':  (sessionId: string) => Promise<void>,
+
+  // 配置
+  'query:switch-model':   (model: string) => Promise<void>,
+  'query:get-context':    () => Promise<SystemPromptContext>,
+  'query:get-cost':       () => Promise<{ inputTokens: number; outputTokens: number; cost: number }>,
+  'query:set-system-prompt': (prompt: string) => Promise<void>,
 }
 
 export function registerQueryIpcHandlers(ipcMain: IpcMain, engine: QueryEngine): void {
@@ -2923,12 +4139,16 @@ export function registerQueryIpcHandlers(ipcMain: IpcMain, engine: QueryEngine):
   ipcMain.on('query:send-stream', async (event, message: string) => {
     for await (const streamEvent of engine.sendMessageStream(message)) {
       event.sender.send('query:stream-event', streamEvent)
-      if (streamEvent.type === 'done') break
+      if (streamEvent.type === 'done' || streamEvent.type === 'error') break
     }
   })
 
-  ipcMain.handle('query:get-history', async () => engine.getHistory())
-  ipcMain.handle('query:clear-history', async () => engine.clearHistory())
+  ipcMain.handle('query:interrupt', async () => engine.abort())
+  ipcMain.handle('query:switch-model', async (_, model: string) => engine.switchModel(model))
+  ipcMain.handle('query:get-cost', async () => engine.getCostInfo())
+  ipcMain.handle('query:list-sessions', async () => engine.listSessions())
+  ipcMain.handle('query:restore-session', async (_, id: string) => engine.restoreSession(id))
+  // ... 其他通道
 }
 ```
 
@@ -2941,8 +4161,24 @@ export interface ConversationState {
   messages: ConversationMessage[]
   isLoading: boolean
   isStreaming: boolean
+  streamingText: string                // 当前流式累积的文本
+  currentToolCalls: Array<{ id: string; name: string; status: 'running' | 'done' | 'error' }>
   error: string | null
+  recoverable: boolean                 // 错误是否可恢复
+
+  // 上下文
   currentDraftContext: SystemPromptContext | null
+  currentModel: string
+  tokenRatio: number                   // 0-1
+
+  // 费用
+  inputTokens: number
+  outputTokens: number
+  estimatedCost: number
+
+  // 会话
+  sessionId: string | null
+  sessions: SessionInfo[]
 }
 
 export const useConversationStore = defineStore('conversation', {
@@ -2950,46 +4186,85 @@ export const useConversationStore = defineStore('conversation', {
     messages: [],
     isLoading: false,
     isStreaming: false,
+    streamingText: '',
+    currentToolCalls: [],
     error: null,
+    recoverable: false,
     currentDraftContext: null,
+    currentModel: 'glm-4-flash',
+    tokenRatio: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    estimatedCost: 0,
+    sessionId: null,
+    sessions: [],
   }),
 
   actions: {
-    async sendMessage(content: string) {
-      this.isLoading = true
-      this.error = null
-      try {
-        const result = await this.invoke('query:send', content)
-        this.messages.push({
-          id: generateId(), role: 'user',
-          content: [{ type: 'text', text: content }], timestamp: Date.now(),
-        })
-        this.messages.push(result)
-      } catch (e) {
-        this.error = e instanceof Error ? e.message : 'Unknown error'
-      } finally {
-        this.isLoading = false
-      }
-    },
+    async sendMessage(content: string) { /* 同步版，处理流式事件更新 state */ },
 
     startStreamMessage(content: string) {
       this.isStreaming = true
+      this.streamingText = ''
+      this.currentToolCalls = []
       this.messages.push({
-        id: generateId(), role: 'user',
+        id: crypto.randomUUID(), role: 'user',
         content: [{ type: 'text', text: content }], timestamp: Date.now(),
       })
-      this.invoke('query:send-stream', content)
+      // IPC 注册 stream-event 监听
     },
 
-    clearHistory() {
-      this.messages = []
-      this.invoke('query:clear-history')
+    /** 处理流式事件（从 IPC stream-event 回调） */
+    handleStreamEvent(event: StreamEvent) {
+      switch (event.type) {
+        case 'text':
+          this.streamingText += event.delta
+          break
+        case 'tool_call_start':
+          this.currentToolCalls.push({ id: event.id, name: event.name, status: 'running' })
+          break
+        case 'tool_result':
+          const tc = this.currentToolCalls.find(t => t.id === event.id)
+          if (tc) tc.status = event.is_error ? 'error' : 'done'
+          break
+        case 'budget_warning':
+          this.tokenRatio = event.used / event.total
+          break
+        case 'model_switch':
+          this.currentModel = event.to
+          break
+        case 'done':
+          this.isStreaming = false
+          // 将 streamingText 推入 messages
+          if (this.streamingText) {
+            this.messages.push({
+              id: crypto.randomUUID(), role: 'assistant',
+              content: [{ type: 'text', text: this.streamingText }],
+              timestamp: Date.now(),
+            })
+            this.streamingText = ''
+          }
+          this.inputTokens += event.result.totalTokens.input
+          this.outputTokens += event.result.totalTokens.output
+          break
+        case 'error':
+          this.isStreaming = false
+          this.error = event.error
+          this.recoverable = event.recoverable
+          break
+      }
     },
+
+    interrupt() { this.invoke('query:interrupt') },
+    clearHistory() { this.messages = []; this.invoke('query:clear-history') },
+    switchModel(model: string) { this.invoke('query:switch-model', model) },
   },
 
   getters: {
     recentMessages: (state) => state.messages.slice(-20),
     hasError: (state) => state.error !== null,
+    totalCost: (state) => state.estimatedCost,
+    contextPercent: (state) => Math.round(state.tokenRatio * 100),
   },
 })
 ```
@@ -3116,74 +4391,114 @@ const props = defineProps<Props>()
 </template>
 ```
 
-##### 3.4.14 任务拆解（13 tasks）
+##### 3.4.14 任务拆解（20 tasks）
 
 | 编号 | 任务 | 交付物 | 依赖 | 验收标准 |
 |------|------|--------|------|----------|
-| P3.4.1 | 消息结构 | `types/message.ts` | - | ConversationMessage + ContentBlock + ApiMessage 接口完成 |
-| P3.4.2 | API 适配层 | `core/queryEngine/apiAdapter.ts` | P3.4.1 | toApiFormat / fromApiFormat 转换正确 |
-| P3.4.3 | System Prompt 动态构建 | `core/queryEngine/systemPrompt.ts` | P3.4.1 | buildSystemPrompt 正确包含工具列表、草稿状态等 |
-| P3.4.4 | 对话上下文与 Compaction | `core/queryEngine/context.ts` | P3.4.1 | 4 层压缩管道正常工作，Token 计数准确 |
-| P3.4.5 | Tool 注册与定义 | `core/queryEngine/toolRegistry.ts` | P3.3.3 | MCP Tool + 本地 Tool 正确注册到 registry |
-| P3.4.6 | Tool 调用执行器 | `core/queryEngine/toolExecutor.ts` | P3.4.5, P3.1.3 | executeToolCallsParallel 混合模式正常 |
-| P3.4.7 | 权限检查集成 | `core/queryEngine/permissionGuard.ts` | P3.1.3, P3.4.6 | Tool 调用前通过 PermissionManager 检查 |
-| P3.4.8 | 权限拒绝处理 | `core/queryEngine/permissionDeniedHandler.ts` | P3.4.7 | 拒绝消息友好、可选策略正确 |
-| P3.4.9 | 流式响应 | `core/queryEngine/stream.ts` | P3.4.6 | AsyncIterable 流式返回 text/tool_call/tool_result |
-| P3.4.10 | QueryEngine 主类 | `core/queryEngine/index.ts` | P3.4.4,6,7,8 | sendMessage / sendMessageStream 正常 |
-| P3.4.11 | IPC Query 通道 | `ipc/query.ts` | P3.4.10 | query:send / query:send-stream 通道正常 |
-| P3.4.12 | Conversation Store | `stores/conversation.ts` | P3.4.11 | messages / isStreaming / error 状态正确 |
-| P3.4.13 | REPL 集成 | `components/REPL/` | P3.4.12 | ChatWindow + PromptInput + StatusBar 完整 |
-| P3.4.14 | 集成测试 | `__tests__/queryEngine/` | P3.4.13 | ReAct 循环全流程通过 |
+| P3.4.1 | 消息结构与核心类型 | `types/message.ts` | - | ConversationMessage + ContentBlock + ApiMessage + LoopResult + ModelConfig 完成 |
+| P3.4.2 | API 适配层 | `core/queryEngine/apiAdapter.ts` | P3.4.1 | toApiFormat + StreamingAccumulator + image block 处理 |
+| P3.4.3 | System Prompt 动态构建 | `core/queryEngine/systemPrompt.ts` | P3.4.1 | buildSystemPrompt 含域知识 + tool JSON Schema + 记忆上下文 |
+| P3.4.4 | 对话上下文与 4 层 Compaction | `core/queryEngine/context.ts` | P3.4.1 | 5 层（snip/micro/session/auto/reactive）完整 + per-model token 计算 |
+| P3.4.5 | Tool Registry（per-engine 实例） | `core/queryEngine/toolRegistry.ts` | P3.3.3 | ToolRegistry 类 + registerMcpTool + createSubset（子 Agent 用） |
+| P3.4.6 | Tool 调用执行器 | `core/queryEngine/toolExecutor.ts` | P3.4.5, P3.1.3 | StreamingToolExecutor: 并发安全并行 + 非安全串行 + per-tool AbortController |
+| P3.4.7 | 权限检查集成 | `core/queryEngine/permissionGuard.ts` | P3.1.3, P3.4.6 | checkAndExecute + 连续拒绝追踪（3次→自动 deny） |
+| P3.4.8 | 权限拒绝处理 | `core/queryEngine/permissionDeniedHandler.ts` | P3.4.7 | 拒绝消息友好 + 策略选择 + 替代方案建议给 AI |
+| P3.4.9 | Agentic Loop + 流式响应 | `core/queryEngine/stream.ts` | P3.4.4,6,7 | streamQuery: 完整终止条件 + abort + budget + error recovery |
+| P3.4.10 | 错误恢复 | `core/queryEngine/errorRecovery.ts` | P3.4.4,9 | Reactive Compact + Fallback Model 切换 + Withholding 机制 |
+| P3.4.11 | 会话持久化 | `core/queryEngine/sessionPersistence.ts` | P3.4.1 | JSONL 格式 + restoreSession + cleanupOldSessions |
+| P3.4.12 | Multi-Agent 集成 | `core/queryEngine/agentTool.ts` | P3.4.5,9 | AgentTool + SubQueryEngine + 独立 tool pool + permission mode |
+| P3.4.13 | QueryEngine 主类 | `core/queryEngine/index.ts` | P3.4.4~12 | sendMessage / sendMessageStream + session 恢复 + model 切换 |
+| P3.4.14 | IPC Query 通道 | `ipc/query.ts` | P3.4.13 | send/send-stream/interrupt/abort-tool/switch-model/get-cost/list-sessions |
+| P3.4.15 | Conversation Store | `stores/conversation.ts` | P3.4.14 | messages + streaming 累积 + cost + draft context + virtual scroll |
+| P3.4.16 | REPL: ChatWindow + MessageRow | `components/REPL/` | P3.4.15 | VirtualList + UserMessage + AssistantMessage + ToolResultMessage |
+| P3.4.17 | REPL: PromptInput | `components/REPL/PromptInput.vue` | P3.4.15 | Enter 发送 / Ctrl+C 中断 / @ 素材补全 / / skill 触发 |
+| P3.4.18 | REPL: StatusBar + PermissionDialog | `components/REPL/` | P3.4.15 | 模型/budget/context% 显示 + 权限确认弹窗 + 进度指示器 |
+| P3.4.19 | REPL: 搜索与历史 | `components/REPL/` | P3.4.16 | 对话内搜索 + 输入历史 + session 切换 |
+| P3.4.20 | 集成测试 | `__tests__/queryEngine/` | P3.4.19 | 全流程: ReAct loop + error recovery + compaction + session 持久化 + multi-agent |
 
 **验收标准**：
-- ReAct 循环正常工作：AI 收到消息 → 判断需要调 Tool → 执行 → 收到结果 → 继续或结束
-- Function Calling 正常：MCP Tool 注册为 functions，AI 输出 tool_calls 格式正确
-- 流式响应正常：文本实时显示，Tool 调用参数完整后才执行
-- 权限集成正常：敏感 Tool 被拒绝时，AI 能感知并给出友好提示
-- Compaction 正常：长对话自动压缩，不丢关键上下文
+1. ReAct 循环正常：AI 收消息 → 调 Tool → 收结果 → 继续/结束，支持 max_turns + abort
+2. Function Calling 正常：MCP Tool 注册为 functions（含完整 JSON Schema），AI 输出 tool_calls 格式正确
+3. 错误恢复正常：prompt_too_long → reactive compact → 重试成功；529 → fallback model 切换
+4. Streaming Tool Execution 正常：并发安全的 tool 并行执行，非安全的串行
+5. Compaction 正常：4 层管道自动触发，长对话压缩后保持关键上下文
+6. Session 持久化正常：进程重启后可恢复会话
+7. Multi-Agent 正常：主 Agent 调用 DraftBuilder 子 Agent，独立 tool pool + 权限
+8. 权限集成正常：敏感 Tool 被拒绝时，AI 能感知并建议替代方案
+9. 流式显示正常：文本实时显示，Tool 进度实时更新
 
 ---
 
-#### Phase 3 开发顺序（4 轮迭代）
+#### Phase 3 开发顺序（5 轮迭代）
 
 ```
 第1轮迭代（基础层）
 ├── P3.1.1 权限基础结构
 ├── P3.2.1 目录结构设计
-├── P3.2.2 数据库表设计
-├── P3.3.1 草稿状态机与类型（DraftStatus 5枚举 + DRAFT_TRANSITIONS）
-├── P3.3.2 草稿数据库表（draft_main + draft_materials + draft_versions）
+├── P3.2.2 数据库表设计（四张素材表 + 分析结果表 + 完整 CREATE TABLE）
+├── P3.2.24 LanceDB 初始化与 Embedding
+├── P3.3.1 草稿状态机与核心类型（DraftStatus 7枚举 + TrackType 6种 + MaterialType 5种）
+├── P3.3.2 草稿数据库表（draft_main + draft_tracks + draft_materials + draft_versions + FTS5）
+├── P3.3.21 FTS 同步触发器
 └── P3.4.1 消息结构
 
 第2轮迭代（核心逻辑）
 ├── P3.1.2 权限存储表
 ├── P3.1.3 权限核心逻辑
 ├── P3.2.3 路径工具函数
-├── P3.2.4~6 素材元数据提取
-├── P3.2.7 添加素材 API
-├── P3.3.3 创建草稿（MCP create_draft 即时交互）
-├── P3.3.4 MaterialInfo 构建器（客户端元数据提取 + Info 构建）
+├── P3.2.4 格式白名单校验
+├── P3.2.5~8 素材元数据提取（视频/音频/图片/文本）
+├── P3.2.9 添加素材 API（含 Hash 去重 + 自动缩略图）
+├── P3.3.3 创建草稿（MCP create_draft + 默认轨道）
+├── P3.3.4 MaterialInfo 构建器（5 种素材类型 Info 构建）
+├── P3.3.5 轨道管理（ensureTrack/muteTrack/removeEmptyTrack）
+├── P3.3.9 草稿元数据更新（rename/description/outputFolder）
 └── P3.4.2 对话上下文
 
-第3轮迭代（IPC 通道）
+第3轮迭代（素材 + 时间线 + 保存/导出）
 ├── P3.1.4 IPC 权限通道
 ├── P3.1.6 权限规则管理
-├── P3.2.8~12 素材查询/搜索/删除/IPC
-├── P3.3.5 添加素材（统一 addMaterial）
-├── P3.3.6~7 草稿保存/导出（MCP save + generate_jianying_draft）
-├── P3.3.8~10 版本管理/列表/删除
-├── P3.4.3~6 System Prompt / Compaction / Tool注册 / 执行器
+├── P3.2.10~11 素材查询/排序
+├── P3.2.12 语义搜索（LanceDB）
+├── P3.2.13~14 素材删除/回收站
+├── P3.2.25 AI 视频分析（短视频）
+├── P3.2.26 AI 智能分割（长视频）
+├── P3.2.27 分析结果存储
+├── P3.2.28 素材-草稿引用计数
+├── P3.3.6 添加素材（统一 addMaterial + 轨道自动分配）
+├── P3.3.7 移除素材（反规范化递减）
+├── P3.3.8 时间线操作（generateTimelines/reorder/trim）
+├── P3.3.11 草稿保存 + 本地快照（snapshot_path）
+├── P3.3.12~13 草稿导出 + 版本管理（snapshot_json + material_refs）
+├── P3.3.14 MCP 恢复机制（snapshot → 重建 MCP）
+├── P3.3.17 草稿计数校验（recalculateCounts）
+├── P3.4.3 System Prompt 动态构建（含域知识 + tool JSON Schema）
+├── P3.4.5 Tool Registry（per-engine 实例 + createSubset）
+├── P3.4.6 Streaming Tool Executor（并发安全并行 + per-tool AbortController）
 
 第4轮迭代（UI + Store + 测试）
 ├── P3.1.5 权限弹窗 UI
 ├── P3.1.7 权限 Store
-├── P3.2.13 Material Store
-├── P3.3.11 IPC 草稿通道
-├── P3.3.12 Draft Store
-├── P3.4.7~9 权限检查 / 拒绝处理 / 流式响应
-├── P3.4.10~12 QueryEngine 主类 / IPC / Conversation Store
-├── P3.4.13 REPL 集成
-└── P3.1.8 / P3.2.14 / P3.3.13 / P3.4.14 集成测试
+├── P3.2.15~17 目录扫描/批量操作/导入
+├── P3.2.18~23 缩略图/预览/别名/收藏/统计/存在性校验
+├── P3.2.29 IPC 素材通道（含进度回调）
+├── P3.2.30 Material Store + 集成测试
+├── P3.3.10 草稿缩略图（FFmpeg 第一帧截取）
+├── P3.3.15 草稿列表（FTS5 搜索 + 统计）
+├── P3.3.16 草稿删除（软删除→硬删除两步）
+├── P3.3.18 IPC 草稿通道（CRUD + Track + Timeline + Recovery）
+├── P3.3.19 Draft Store（含 tracks + materials + dirty + error）
+├── P3.3.20 草稿复制
+├── P3.4.7~8 权限检查集成 + 连续拒绝追踪 + 拒绝处理
+├── P3.4.9 Agentic Loop（完整终止条件 + abort + budget + error recovery）
+├── P3.4.10 错误恢复（Reactive Compact + Fallback Model + Withholding）
+├── P3.4.11 会话持久化（JSONL + restoreSession）
+├── P3.4.12 Multi-Agent 集成（AgentTool + SubQueryEngine）
+├── P3.4.13 QueryEngine 主类（session 恢复 + model 切换）
+├── P3.4.14 IPC Query 通道（send/interrupt/abort/switch-model/list-sessions）
+├── P3.4.15 Conversation Store（streaming 累积 + cost + draft context）
+├── P3.4.16~19 REPL 组件（ChatWindow + PromptInput + StatusBar + PermissionDialog + 搜索）
+└── P3.1.8 / P3.2.30 / P3.3.22 / P3.4.20 集成测试
 ```
 
 ---
@@ -3196,127 +4511,604 @@ const props = defineProps<Props>()
 
 | 问题 | 决策 |
 |------|------|
-| 测试策略 | 真实 API（沙盒），使用 bailian/MiniMax 沙盒 Key |
-| AI Key 管理 | 用户自配，App 不内置 Key |
+| 测试策略 | **双层**：单元测试用 `mock.module()` 隔离（快速/确定/免费）+ E2E 用真实 API 验证（sandbox 或用户提供 Key） |
+| Mock 基础设施 | 参考 Claude Code：`tests/mocks/` + `mock.module()` + API Response Fixture + Test Data Factory |
+| AI Key 管理 | 用户自配，App 不内置 Key；`.env.sandbox.example` + `.gitignore`（不提交真实 Key） |
 | 特效/滤镜/关键帧 | 移至 Phase 5 |
 | 发布平台 | Windows x64 优先，macOS 后续版本 |
 
 ---
 
-#### Phase 4.1：核心 ReAct 循环测试（6 tasks）
+#### Phase 4.1：核心 ReAct 循环测试（14 tasks）
 
-> 使用真实 AI API（沙盒环境）验证完整 ReAct 循环
+> **双层测试策略**：Mock 驱动的单元/集成测试（覆盖所有子系统） + 真实 API 的 E2E 验证
+
+##### 4.1.1 Mock 基础设施
+
+参考 Claude Code `tests/mocks/` + `mock.module()` 模式：
+
+```typescript
+// tests/mocks/api-responses.ts — 预构建 API 响应 fixture
+
+/** 纯文本流式响应 chunks */
+export function textStreamChunks(text: string): ApiStreamChunk[] {
+  return [{ choices: [{ delta: { content: text } }] }, { choices: [{ delta: {} }] }]
+}
+
+/** Tool Call 流式响应 chunks */
+export function toolCallStreamChunks(name: string, args: Record<string, unknown>): ApiStreamChunk[] {
+  return [
+    { choices: [{ delta: { tool_calls: [{ id: 'call_1', function: { name, arguments: '' } }] } }] },
+    { choices: [{ delta: { tool_calls: [{ function: { arguments: JSON.stringify(args) } }] } }] },
+    { choices: [{ delta: {} }] },
+  ]
+}
+
+/** Multi-Tool Call 响应 */
+export function multiToolCallChunks(calls: Array<{ name: string; args: Record<string, unknown> }>): ApiStreamChunk[]
+
+/** 错误响应 fixture */
+export const ERROR_RESPONSES = {
+  rate_limit_429: { status: 429, message: 'Rate limit exceeded', type: 'rate_limit' },
+  prompt_too_long: { status: 400, message: 'prompt is too long', type: 'prompt_too_long' },
+  max_output_tokens: { status: 200, finishReason: 'max_tokens', type: 'max_output_tokens' },
+  server_error_500: { status: 500, message: 'Internal server error', type: 'server_error' },
+}
+
+/** Mock API Client（替换 mock.module()） */
+export function createMockApiClient(responses: ApiStreamChunk[][]): ApiClient {
+  let callIndex = 0
+  return {
+    chat: {
+      completions: {
+        create: async function* () {
+          const chunks = responses[callIndex++] || responses[responses.length - 1]
+          for (const chunk of chunks) yield chunk
+        },
+      },
+    },
+  } as unknown as ApiClient
+}
+```
+
+```typescript
+// tests/mocks/factories.ts — Test Data Factory
+
+export function createTestMessage(overrides?: Partial<ConversationMessage>): ConversationMessage {
+  return {
+    id: crypto.randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text: 'test message' }],
+    timestamp: Date.now(),
+    ...overrides,
+  }
+}
+
+export function createTestToolCall(name: string, input: Record<string, unknown>): ToolUseBlock {
+  return { type: 'tool_use', id: `call_${Math.random().toString(36).slice(2)}`, name, input }
+}
+
+export function createTestConversation(turns: number): ConversationMessage[] {
+  const msgs: ConversationMessage[] = []
+  for (let i = 0; i < turns; i++) {
+    msgs.push(createTestMessage({ role: 'user', content: [{ type: 'text', text: `turn ${i}` }] }))
+    msgs.push(createTestMessage({ role: 'assistant', content: [{ type: 'text', text: `reply ${i}` }] }))
+  }
+  return msgs
+}
+```
+
+##### 4.1.2 任务拆解（14 tasks）
 
 | 编号 | 任务 | 交付物 | 依赖 | 验收标准 |
 |------|------|--------|------|----------|
-| P4.1.1 | 沙盒测试环境搭建 | `.env.sandbox` + `tests/sandbox/` | - | 沙盒 API Key 可用，测试账号可登录 |
-| P4.1.2 | QueryEngine 单元测试 | `__tests__/queryEngine/message.test.ts` | P3.4.1 | 消息构建 + API 适配层 + 流式解析通过 |
-| P4.1.3 | ToolExecutor 单元测试 | `__tests__/queryEngine/executor.test.ts` | P3.4.6 | 并行/串行执行 + 依赖检测 + 权限模拟通过 |
-| P4.1.4 | IPC Query 通道集成测试 | `__tests__/ipc/query.test.ts` | P3.4.11 | send / send-stream 通道正常 |
-| P4.1.5 | 权限流程集成测试 | `__tests__/queryEngine/permission.test.ts` | P3.1.7, P3.4.7 | 正常授权/拒绝/记住/会话过期全流程通过 |
-| P4.1.6 | 完整 ReAct 循环 E2E 测试 | `__tests__/e2e/react-loop.test.ts` | P4.1.2~5 | AI → Tool → Result → AI → FinalResponse 全流程通过 |
+| P4.1.1 | Mock 基础设施 | `tests/mocks/api-responses.ts` + `tests/mocks/factories.ts` | - | API Response Fixture + Test Data Factory + createMockApiClient 可用 |
+| P4.1.2 | 消息结构 + API 适配 单元测试 | `__tests__/queryEngine/message.test.ts` | P3.4.1, P4.1.1 | toApiFormat(text/tool/image) + StreamingAccumulator(增量累积) + Image Block 转换通过 |
+| P4.1.3 | System Prompt 构建测试 | `__tests__/queryEngine/systemPrompt.test.ts` | P3.4.3, P4.1.1 | buildSystemPrompt 输出含域知识 + tool JSON Schema + 草稿状态 + 记忆上下文 |
+| P4.1.4 | Tool Registry 测试 | `__tests__/queryEngine/toolRegistry.test.ts` | P3.4.5 | register/get/registerMcpTool/createSubset（子 Agent 独立池）通过 |
+| P4.1.5 | Streaming Tool Executor 单元测试 | `__tests__/queryEngine/streamingToolExecutor.test.ts` | P3.4.9a, P4.1.1 | 并发安全并行 + 非安全串行 + per-tool AbortController + progress message + 结果按序输出 |
+| P4.1.6 | Compaction 单元测试 | `__tests__/queryEngine/compaction.test.ts` | P3.4.4, P4.1.1 | 5 层（snip/micro/session/auto/reactive）各自正确 + token 计数 + preservePriority 验证 |
+| P4.1.7 | Error Recovery 单元测试 | `__tests__/queryEngine/errorRecovery.test.ts` | P3.4.10, P4.1.1 | prompt_too_long → reactive compact → 重试、529 → fallback model、max_output_tokens → token 升级、全失败 → graceful error |
+| P4.1.8 | Session Persistence 单元测试 | `__tests__/queryEngine/sessionPersistence.test.ts` | P3.4.11 | appendMessage(JSONL) + restoreSession(恢复) + UUID 链完整性 + cleanupOldSessions(过期清理) |
+| P4.1.9 | PermissionGuard + Denial 测试 | `__tests__/queryEngine/permission.test.ts` | P3.1.3, P3.4.7, P4.1.1 | allow/deny/ask + 连续拒绝追踪(3次→auto deny) + 替代方案建议 |
+| P4.1.10 | Agentic Loop 核心测试 | `__tests__/queryEngine/agenticLoop.test.ts` | P3.4.9, P4.1.1 | 8 种 LoopExitReason + abort 中断 + budget exceeded + max_turns + error recovery + model switch（全部用 mock） |
+| P4.1.11 | Multi-Agent 测试 | `__tests__/queryEngine/multiAgent.test.ts` | P3.4.12, P4.1.1 | AgentTool handler + 子 Agent 独立 tool pool + permission mode 隔离 + abort 传播 |
+| P4.1.12 | IPC Query 全通道集成测试 | `__tests__/ipc/query.test.ts` | P3.4.14 | send/send-stream/interrupt/abort-tool/switch-model/list-sessions/restore-session/get-cost 共 14 通道 |
+| P4.1.13 | 完整 ReAct 循环 Mock E2E | `__tests__/e2e/react-loop-mock.test.ts` | P4.1.2~11 | Happy path + error path + abort + compaction triggered + model switch（mock API，确定性断言） |
+| P4.1.14 | 真实 API E2E 验证 | `__tests__/e2e/react-loop-live.test.ts` | P4.1.13 | 5 个场景（创建/添加/查询/保存/删除）通过真实 AI API（sandbox 或用户提供 Key） |
 
-**沙盒测试环境配置**：
+##### 4.1.3 测试环境配置
 
 ```bash
-# .env.sandbox
-BAILIAN_API_KEY=sandbox_xxx
-BAILIAN_API_BASE=https://api-sandbox.bailian.com
-MINIMAX_API_KEY=sandbox_xxx
-MINIMAX_API_BASE=https://api-sandbox.minimax.io
+# .env.sandbox.example（提交到 repo，不含真实 Key）
+# 复制为 .env.sandbox 并填入真实 Key（已加入 .gitignore）
+BAILIAN_API_KEY=your_key_here
+BAILIAN_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1
+MINIMAX_API_KEY=your_key_here
+MINIMAX_API_BASE=https://api.minimax.chat/v1
+GLM_API_KEY=your_key_here
+GLM_API_BASE=https://open.bigmodel.cn/api/paas/v4
 ```
 
-**E2E 测试用例**：
+```typescript
+// tests/helpers/sandbox.ts
+/** 检查 sandbox 环境是否可用（跳过不可用的 live 测试） */
+export function isSandboxAvailable(): boolean {
+  return !!(process.env.BAILIAN_API_KEY || process.env.MINIMAX_API_KEY || process.env.GLM_API_KEY)
+}
 
-| 用例 | 输入 | 期望 |
-|------|------|------|
-| U1 | "帮我创建一个 1920x1080 的草稿" | create_draft 被调用，返回 draft_id |
-| U2 | "添加 E:\test.mp4 到草稿" | add_videos 被调用，素材路径正确解析 |
-| U3 | "草稿里有哪些素材" | get_draft_materials 被调用，返回素材列表 |
-| U4 | "保存草稿" | save_draft 被调用，JSON 正确生成 |
-| U5 | "删除刚才的草稿" | delete_draft 被调用，确认删除 |
+/** describeIfSandbox — 仅在 sandbox 可用时运行 */
+export const describeIfSandbox = isSandboxAvailable() ? describe : describe.skip
+```
+
+##### 4.1.4 E2E 测试用例（Mock + Live 双版本）
+
+| 用例 | 输入 | Mock 断言 | Live 验证 |
+|------|------|-----------|-----------|
+| U1 | "创建一个 1920x1080 的草稿" | create_draft tool 被调用，参数 {width:1920, height:1080} | MCP create_draft 成功，返回 draft_id |
+| U2 | "添加 E:\test.mp4" | add_videos tool 被调用，path 含 "test.mp4" | 素材记录写入 draft_materials |
+| U3 | "草稿里有哪些素材" | get_draft_materials tool 被调用 | 返回素材列表 |
+| U4 | "保存草稿" | save_draft tool 被调用 | JSON 文件生成 |
+| U5 | "删除刚才的草稿" | delete_draft tool 被调用 + 权限确认触发 | 草稿标记 ARCHIVED |
+| U6 | 用户中断（Ctrl+C） | abort 事件发出，LoopResult.reason='aborted_streaming' | — |
+| U7 | API 返回 429 | model_switch 事件发出，fallback model 被使用 | — |
+| U8 | 长对话触发 compaction | context_compaction 事件发出，preservePriority 正确 | — |
+| U9 | Tool 权限被拒绝 | tool_result.is_error=true，AI 收到拒绝消息后给出替代建议 | — |
+
+##### 4.1.5 测试文件结构
+
+```
+tests/
+├── mocks/
+│   ├── api-responses.ts        # API 响应 fixture（text/tool_call/error/multi_tool）
+│   ├── factories.ts            # Test Data Factory（createTestMessage/ToolCall/Conversation）
+│   └── mock-modules.ts         # mock.module() 统一入口（mockApiClient/mockMcpClient/mockPermissionManager）
+├── helpers/
+│   └── sandbox.ts              # sandbox 环境检测 + describeIfSandbox
+├── __tests__/
+│   ├── queryEngine/
+│   │   ├── message.test.ts     # 消息结构 + API 适配 + StreamingAccumulator
+│   │   ├── systemPrompt.test.ts # System Prompt 构建
+│   │   ├── toolRegistry.test.ts # Tool Registry + createSubset
+│   │   ├── streamingToolExecutor.test.ts # 并发/串行/abort/progress
+│   │   ├── compaction.test.ts  # 5 层 compaction + token 计数
+│   │   ├── errorRecovery.test.ts # 4 层 error recovery
+│   │   ├── sessionPersistence.test.ts # JSONL 读写 + 恢复 + 清理
+│   │   ├── permission.test.ts  # 权限检查 + 连续拒绝 + 拒绝策略
+│   │   ├── agenticLoop.test.ts # 核心循环（8 种退出条件）
+│   │   └── multiAgent.test.ts  # AgentTool + SubQueryEngine
+│   ├── ipc/
+│   │   └── query.test.ts       # 14 个 IPC 通道
+│   └── e2e/
+│       ├── react-loop-mock.test.ts  # Mock E2E（确定性，CI 必跑）
+│       └── react-loop-live.test.ts  # Live E2E（需 sandbox Key，CI 可选）
+```
 
 ---
 
-#### Phase 4.2：素材路径处理优化（3 tasks）
+#### Phase 4.2：素材路径体系（11 tasks）
+
+> **设计原则**：
+> 1. 跨平台优先（Windows + macOS），路径工具放在 `packages/shared/` 共享包
+> 2. 内部统一使用绝对路径 + 平台原生分隔符，仅在与外部系统交互时转换
+> 3. 参考 DMVideo `local_materials.py` 的 `os.path.abspath()` + `os.path.exists()` 双重校验模式
+> 4. MCP Server 为 TypeScript（与 Electron 打包），路径处理器也是 `.ts`
 
 | 编号 | 任务 | 交付物 | 依赖 | 验收标准 |
 |------|------|--------|------|----------|
-| P4.2.1 | Windows 路径规范化工具 | `utils/path.ts` | - | normalize / isAbsolute / resolve 正确处理 Windows 路径 |
-| P4.2.2 | MCP Server 路径校验增强 | `core/mcp/handlers/material.py` | P1.3 | 校验失败返回友好错误，不直接崩溃 |
-| P4.2.3 | Electron 路径解析统一 | `src/utils/path.ts` | P2.5 | MaterialManager 使用统一路径工具函数 |
+| P4.2.1 | 跨平台路径核心工具 | `packages/shared/src/path/core.ts` | - | normalize/resolve/toFileUrl/fromFileUrl/realpath 跨平台正确；symlink/junction 自动解析 |
+| P4.2.2 | 剪映 JSON 路径双向映射 | `packages/shared/src/path/jianying.ts` | P4.2.1 | toJianYingPath/fromJianYingPath 双向转换，生成 draft_content.json 中 materials 路径格式正确 |
+| P4.2.3 | 路径安全与边界校验 | `packages/shared/src/path/security.ts` | P4.2.1 | isWithinRoot 防路径遍历；UNC `\\server\share` 路径支持；Windows 长路径 `\\?\` 前缀处理 |
+| P4.2.4 | 中文/Unicode 路径处理 | `packages/shared/src/path/unicode.ts` | P4.2.1 | 中文路径 `E:\视频\旅行.mp4` → file URL 正确 percent-encoding；macOS UTF-8 NFD/NFC 归一化 |
+| P4.2.5 | 文件名清理与大小写统一 | `packages/shared/src/path/sanitize.ts` | - | sanitizeFilename 清理非法字符；Windows 大小写不敏感去重辅助 |
+| P4.2.6 | 素材存在性与完整性校验 | `core/material/integrity.ts` | P4.2.1 | existsCheck + staleRefScan 扫描失效引用；校验失败返回 MaterialIntegrityReport |
+| P4.2.7 | 剪映草稿目录发现与配置 | `core/draft/draftRoot.ts` | P4.2.1 | 自动发现 Windows/macOS 剪映安装路径下草稿目录；支持用户手动覆盖 |
+| P4.2.8 | 路径变更监听与引用更新 | `core/material/pathWatcher.ts` | P4.2.1, P4.2.6 | fs.watch 监听素材移动/重命名；自动更新 DB file_path + 草稿 JSON 引用 |
+| P4.2.9 | 缩略图路径生成规则 | `core/material/thumbnailPath.ts` | P4.2.1, P4.2.5 | 缩略图相对素材根目录 `thumbnails/{material_id}.jpg`；路径与素材路径联动 |
+| P4.2.10 | MCP Server 路径校验增强 | `core/mcp/handlers/materialPath.ts` | P4.2.1, P4.2.3 | 校验失败返回中文友好错误 + ErrorCode，不崩溃；集成安全校验 |
+| P4.2.11 | Electron 集成层 | `src/utils/path.ts` | P4.2.1~P4.2.10 | 统一 re-export + MaterialManager 全量接入；路径工具单入口 |
 
-**Windows 路径处理规范**：
+**路径工具架构（分层）**：
+
+```
+packages/shared/src/path/        ← 底层路径原语（纯函数，无 side-effect）
+├── core.ts       # P4.2.1 normalize, resolve, toFileUrl, fromFileUrl, realpath
+├── jianying.ts   # P4.2.2 toJianYingPath, fromJianYingPath
+├── security.ts   # P4.2.3 isWithinRoot, validateMaterialPath, UNC, long path
+├── unicode.ts    # P4.2.4 percentEncode, percentDecode, normalizeNFC
+└── sanitize.ts   # P4.2.5 sanitizeFilename, normalizeCase
+
+core/material/                    ← 业务层路径逻辑
+├── integrity.ts    # P4.2.6 existsCheck, staleRefScan, hashVerify
+├── pathWatcher.ts  # P4.2.8 watchMaterialDir, updateReferences
+└── thumbnailPath.ts # P4.2.9 generateThumbnailPath
+
+core/draft/
+└── draftRoot.ts    # P4.2.7 discoverJianYingDraftRoot, validateDraftRoot
+
+core/mcp/handlers/
+└── materialPath.ts # P4.2.10 validateAndResolveMaterialPath
+
+src/utils/path.ts                 ← Electron 集成层（re-export + 适配）
+                    # P4.2.11
+```
+
+**跨平台路径处理规范**：
 
 ```typescript
-// 正确格式
-"E:\\videos\\test.mp4"
-"E:/videos/test.mp4"
-"file:///E:/videos/test.mp4"
+// ── P4.2.1: 跨平台核心 ──
+import { normalize, resolve, isAbsolute } from 'packages/shared/src/path/core'
 
-// 工具函数
-normalizePath("E:\\videos\\test.mp4") → "E:\\videos\\test.mp4"
-toFileUrl("E:\\videos\\test.mp4") → "file:///E:/videos/test.mp4"
+// Windows
+normalizePath("E:\\videos\\test.mp4")     → "E:\\videos\\test.mp4"
+normalizePath("E:/videos/test.mp4")       → "E:\\videos\\test.mp4"  // 统一为平台分隔符
+normalizePath("C:/Users/中文/视频.mp4")    → "C:\\Users\\中文\\视频.mp4"
+toFileUrl("E:\\videos\\test.mp4")         → "file:///E:/videos/test.mp4"
 fromFileUrl("file:///E:/videos/test.mp4") → "E:\\videos\\test.mp4"
+
+// macOS
+normalizePath("/Users/xxx/video.mp4")     → "/Users/xxx/video.mp4"
+toFileUrl("/Users/xxx/video.mp4")         → "file:///Users/xxx/video.mp4"
+
+// UNC 路径 (Windows)
+normalizePath("\\\\NAS\\share\\video.mp4") → "\\\\NAS\\share\\video.mp4"
+toFileUrl("\\\\NAS\\share\\video.mp4")     → "file://NAS/share/video.mp4"
+
+// Symlink/Junction 自动解析
+realpath("C:\\Users\\用户\\Documents\\video.mp4")  → 实际 NTFS 路径
+
+// ── P4.2.2: 剪映 JSON 路径映射 ──
+import { toJianYingPath, fromJianYingPath } from 'packages/shared/src/path/jianying'
+
+// 写入 draft_content.json → materials.videos[].path 时的格式
+toJianYingPath("E:\\素材\\test.mp4")  → 素材在 JSON 中的标准格式
+fromJianYingPath(jsonPath)             → "E:\\素材\\test.mp4" (本地绝对路径)
+
+// ── P4.2.3: 安全校验 ──
+import { isWithinRoot, validateMaterialPath } from 'packages/shared/src/path/security'
+
+isWithinRoot("E:\\素材\\test.mp4", "E:\\素材")   → true
+isWithinRoot("E:\\..\\etc\\passwd", "E:\\素材")  → false (路径遍历拦截)
+
+// Windows 长路径自动处理
+validateMaterialPath("E:\\超长\\嵌套\\...\\250字符以上\\test.mp4")
+// → 自动添加 \\?\ 前缀
+
+// ── P4.2.4: Unicode 处理 ──
+import { percentEncodePath, normalizeNFC } from 'packages/shared/src/path/unicode'
+
+percentEncodePath("E:\\视频\\旅行素材\\北京.mp4")
+// → "file:///E:/%E8%A7%86%E9%A2%91/%E6%97%85%E8%A1%8C%E7%B4%A0%E6%9D%90/%E5%8C%97%E4%BA%AC.mp4"
+
+// macOS NFD→NFC 归一化（避免同文件不同编码导致去重失败）
+normalizeNFC("/Users/xxx/café.mp4") → "/Users/xxx/café.mp4" (NFC 统一)
+
+// ── P4.2.5: 文件名清理 ──
+import { sanitizeFilename, normalizeCase } from 'packages/shared/src/path/sanitize'
+
+sanitizeFilename('视频: "2024*旅行?.mp4') → '视频_ _2024_旅行_.mp4'
+normalizeCase("E:\\VIDEO\\Test.MP4")       → "E:\\video\\test.mp4" (Windows 小写归一化)
+```
+
+**剪映草稿目录发现规则（P4.2.7）**：
+
+```
+// Windows 常见路径
+%LOCALAPPDATA%/JianyingPro/User Data/Projects/com.lveditor.draft
+%LOCALAPPDATA%/CapCut/User Data/Projects/com.lveditor.draft         ← 剪映国际版
+
+// macOS 常见路径
+~/Movies/JianyingPro/User Data/Projects/com.lveditor.draft
+~/Movies/CapCut/User Data/Projects/com.lveditor.draft               ← 国际版
+
+// 发现策略
+1. 扫描上述默认路径，取第一个存在的
+2. 检查路径下是否有 draft_meta_info.json 文件结构
+3. 允许用户在设置中手动覆盖草稿根目录
+4. 多版本共存时展示列表让用户选择
+```
+
+**路径变更监听策略（P4.2.8）**：
+
+```typescript
+// 监听范围
+// - 仅监听素材根目录及其子目录
+// - 排除 .git/、node_modules/、thumbnails/ 等干扰目录
+// - 使用 fs.watch (Electron 主进程) + 防抖 (300ms)
+
+// 素材移动/重命名时的处理流程：
+// 1. 检测到 rename/move 事件
+// 2. 查找 DB 中旧路径 → 获取关联的 material_id
+// 3. 查找所有引用该 material_id 的草稿 JSON
+// 4. 批量更新 DB file_path + 草稿 JSON 中 materials.*[].path
+// 5. 更新缩略图路径（如果缩略图与素材同目录）
+// 6. 发送 IPC 广播通知 UI 刷新
+
+// 素材被删除时的处理：
+// - 标记 material.is_deleted = 1（软删除）
+// - 保留引用关系，在草稿中标记为"素材缺失"
+// - UI 显示黄色警告而非直接移除
+```
+
+**素材存在性校验报告（P4.2.6）**：
+
+```typescript
+interface MaterialIntegrityReport {
+  totalChecked: number
+  missing: Array<{ materialId: string; path: string; referencedByDrafts: string[] }>
+  moved: Array<{ materialId: string; oldPath: string; newPath: string }>
+  corrupted: Array<{ materialId: string; path: string; reason: string }>
+}
+
+// 校验时机：
+// 1. 打开草稿时自动校验该草稿引用的素材
+// 2. 用户手动触发全量扫描（设置面板）
+// 3. 素材导入后立即校验新导入项
 ```
 
 ---
 
-#### Phase 4.3：错误处理与提示（5 tasks）
+#### Phase 4.3：错误处理与提示（11 tasks）
+
+> **设计原则**：对照 DMVideo 后端 10 种自定义异常 + 统一 `{code, message, data}` 响应格式，
+> 前端 HttpError 类 + 重试机制，建立完整的错误处理链路。
+> 与 P3.4.10（内部错误恢复：Reactive Compact + Fallback Model）互补，
+> 本阶段聚焦 **面向用户的错误体验**。
 
 | 编号 | 任务 | 交付物 | 依赖 | 验收标准 |
 |------|------|--------|------|----------|
-| P4.3.1 | 统一 ErrorCode 枚举 | `types/error.ts` | - | 错误码覆盖 MCP / IPC / UI 各层 |
-| P4.3.2 | MCP Server 错误转换 | `core/mcp/errors.py` | P1.3 | 所有异常转换为标准错误格式 |
-| P4.3.3 | IPC 层错误传递 | `ipc/errors.ts` | P3.4.11 | 错误通过 IPC 通道正确传递 |
-| P4.3.4 | REPL 错误展示组件 | `components/REPL/ErrorMessage.vue` | P3.4.13 | 友好中文提示，非英文原始错误 |
-| P4.3.5 | 错误恢复策略 | `core/queryEngine/errorRecovery.ts` | P3.4.8 | Simple Retry：显示错误 + 询问用户是否重试 |
+| P4.3.1 | 统一 ErrorCode 枚举（6 大领域） | `types/error.ts` | - | 覆盖 MCP / IPC / AI / Draft / Material / Export 6 大领域 ≥30 个错误码 |
+| P4.3.2 | 标准错误响应格式（跨层传递） | `types/errorResponse.ts` | P4.3.1 | MCP → IPC → UI 三层错误传递链格式统一 |
+| P4.3.3 | MCP Server 错误转换 | `core/mcp/errors.ts` | P1.3, P4.3.1 | 所有 MCP 异常转为标准 ErrorCode，含断线/重连/版本不兼容 |
+| P4.3.4 | IPC 层错误传递 | `ipc/errors.ts` | P3.4.11, P4.3.2 | 错误通过 IPC 通道正确传递，保留 cause chain |
+| P4.3.5 | 错误日志基础设施 | `core/telemetry/errorLogger.ts` | P4.3.1 | 结构化错误日志 + 上下文收集 + 按错误码聚合 |
+| P4.3.6 | Vue Error Boundary + 全局错误捕获 | `components/common/ErrorBoundary.vue` | - | 组件崩溃不白屏，未处理 Promise 拒绝不丢失 |
+| P4.3.7 | 全局错误 Store + Toast 通知 | `stores/error.ts` + `components/common/ToastNotification.vue` | P4.3.1, P4.3.6 | useErrorStore 管理错误队列，Toast 非阻塞提示 |
+| P4.3.8 | 分场景错误展示组件 | `components/errors/` | P4.3.7 | REPL / 设置 / 素材面板 / 时间线 / 导出 5 个场景错误组件 |
+| P4.3.9 | 用户侧错误恢复体验 | `core/queryEngine/userErrorRecovery.ts` | P3.4.10, P4.3.7 | 分级重试策略 + 恢复建议 + 用户确认流程（不与 P3.4.10 冲突） |
+| P4.3.10 | 校验错误格式与展示 | `types/validation.ts` | P4.3.1 | 字段级校验错误 {field, message, value} + 表单内联展示 |
+| P4.3.11 | 错误处理集成测试 | `__tests__/errorHandling/` | P4.3.1-P4.3.10 | 错误码映射 + IPC 传递 + Error Boundary + Toast + 重试策略 覆盖 |
 
-**ErrorCode 枚举设计**：
+**错误处理架构（3 层）**：
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│ Layer 1 — 类型层 (types/)                                     │
+│  types/error.ts          ErrorCode 枚举（6 大领域）+ AppError │
+│  types/errorResponse.ts  StandardErrorResponse 跨层格式       │
+│  types/validation.ts     ValidationError 字段级校验           │
+├───────────────────────────────────────────────────────────────┤
+│ Layer 2 — 核心层 (core/)                                      │
+│  core/mcp/errors.ts           MCP 异常 → ErrorCode 转换       │
+│  core/telemetry/errorLogger.ts 结构化日志 + 聚合              │
+│  core/queryEngine/userErrorRecovery.ts 用户侧恢复体验         │
+│  ipc/errors.ts                IPC 错误封装 + cause chain      │
+├───────────────────────────────────────────────────────────────┤
+│ Layer 3 — 表现层 (components/ + stores/)                      │
+│  stores/error.ts              useErrorStore 全局错误状态       │
+│  components/common/ErrorBoundary.vue    Vue 错误边界          │
+│  components/common/ToastNotification.vue Toast 通知           │
+│  components/errors/            分场景错误组件目录              │
+│    REPLError.vue              REPL 错误（替代旧 ErrorMessage）│
+│    SettingsError.vue          设置页错误                       │
+│    MaterialError.vue          素材面板错误                     │
+│    TimelineError.vue          时间线编辑错误                   │
+│    ExportError.vue            导出对话框错误                   │
+└───────────────────────────────────────────────────────────────┘
+```
+
+**ErrorCode 枚举设计（6 大领域 ≥30 个错误码）**：
 
 ```typescript
-// types/error.ts
+// types/error.ts — 对照 DMVideo exceptions.py 10 种异常 + plan 架构场景
+
 export enum ErrorCode {
-  // MCP 层错误（服务端）
-  MCP_DRAFT_NOT_FOUND = "MCP_DRAFT_NOT_FOUND",      // 草稿不存在
-  MCP_MATERIAL_NOT_FOUND = "MCP_MATERIAL_NOT_FOUND", // 素材不存在
-  MCP_PATH_INVALID = "MCP_PATH_INVALID",           // 路径无效
-  MCP_AUTH_FAILED = "MCP_AUTH_FAILED",            // 认证失败
-  MCP_PERMISSION_DENIED = "MCP_PERMISSION_DENIED", // 权限拒绝
-  MCP_INTERNAL_ERROR = "MCP_INTERNAL_ERROR",       // 内部错误
+  // ─── MCP 层错误（服务端）─── DMVideo 对应: 全局异常处理器 + 业务 code
+  MCP_DRAFT_NOT_FOUND = "MCP_DRAFT_NOT_FOUND",         // 草稿不存在
+  MCP_MATERIAL_NOT_FOUND = "MCP_MATERIAL_NOT_FOUND",   // 素材不存在
+  MCP_PATH_INVALID = "MCP_PATH_INVALID",               // 路径无效
+  MCP_AUTH_FAILED = "MCP_AUTH_FAILED",                  // 认证失败
+  MCP_PERMISSION_DENIED = "MCP_PERMISSION_DENIED",      // 权限拒绝
+  MCP_INTERNAL_ERROR = "MCP_INTERNAL_ERROR",            // 内部错误
+  MCP_CONNECTION_LOST = "MCP_CONNECTION_LOST",          // MCP Server 断线
+  MCP_VERSION_MISMATCH = "MCP_VERSION_MISMATCH",        // MCP 版本不兼容
+  MCP_STATE_SYNC_FAILED = "MCP_STATE_SYNC_FAILED",      // 重连后状态同步失败
 
-  // IPC 层错误（客户端）
-  IPC_CONNECTION_FAILED = "IPC_CONNECTION_FAILED",  // IPC 连接失败
-  IPC_TIMEOUT = "IPC_TIMEOUT",                     // 调用超时
-  IPC_CHANNEL_NOT_FOUND = "IPC_CHANNEL_NOT_FOUND",  // 通道不存在
+  // ─── IPC 层错误（客户端）─── DMVideo 对应: ipc_handle try/catch 统一
+  IPC_CONNECTION_FAILED = "IPC_CONNECTION_FAILED",      // IPC 连接失败
+  IPC_TIMEOUT = "IPC_TIMEOUT",                          // 调用超时
+  IPC_CHANNEL_NOT_FOUND = "IPC_CHANNEL_NOT_FOUND",      // 通道不存在
+  IPC_SERIALIZATION_ERROR = "IPC_SERIALIZATION_ERROR",  // 序列化/反序列化失败
 
-  // AI 层错误
-  AI_API_ERROR = "AI_API_ERROR",                   // API 调用失败
-  AI_RATE_LIMIT = "AI_RATE_LIMIT",                 // 限流
-  AI_INVALID_RESPONSE = "AI_INVALID_RESPONSE",      // 响应格式错误
+  // ─── AI 层错误 ─── DMVideo 对应: bailian withAuthRetry + httpClient 状态码映射
+  AI_API_ERROR = "AI_API_ERROR",                        // API 调用失败
+  AI_RATE_LIMIT = "AI_RATE_LIMIT",                      // 限流
+  AI_INVALID_RESPONSE = "AI_INVALID_RESPONSE",          // 响应格式错误
+  AI_TOKEN_BUDGET_EXCEEDED = "AI_TOKEN_BUDGET_EXCEEDED",// Token 预算耗尽
+  AI_MODEL_UNAVAILABLE = "AI_MODEL_UNAVAILABLE",        // 模型不可用
 
-  // 通用错误
+  // ─── 草稿错误 ─── DMVideo 对应: DraftNotFound + DraftStatus.ERROR 状态机
+  DRAFT_NOT_FOUND = "DRAFT_NOT_FOUND",                  // 草稿不存在
+  DRAFT_CORRUPTED = "DRAFT_CORRUPTED",                  // 草稿 JSON 损坏
+  DRAFT_VERSION_INCOMPATIBLE = "DRAFT_VERSION_INCOMPATIBLE",// 剪映版本不兼容
+  DRAFT_STATE_INVALID = "DRAFT_STATE_INVALID",          // 状态机非法转换
+  DRAFT_EXPORT_FAILED = "DRAFT_EXPORT_FAILED",          // 导出失败
+
+  // ─── 素材/时间线错误 ─── DMVideo 对应: MaterialNotFound, SegmentOverlap, TrackNotFound 等
+  MATERIAL_NOT_FOUND = "MATERIAL_NOT_FOUND",            // 素材不存在
+  MATERIAL_FORMAT_UNSUPPORTED = "MATERIAL_FORMAT_UNSUPPORTED",// 格式不支持
+  MATERIAL_INTEGRITY_FAILED = "MATERIAL_INTEGRITY_FAILED",   // 完整性校验失败
+  SEGMENT_OVERLAP = "SEGMENT_OVERLAP",                  // 片段重叠
+  TRACK_NOT_FOUND = "TRACK_NOT_FOUND",                  // 轨道不存在
+  TRACK_TYPE_MISMATCH = "TRACK_TYPE_MISMATCH",          // 轨道类型不匹配
+
+  // ─── 存储/导出错误 ─── DMVideo 对应: ExportTimeout + 文件系统操作
+  STORAGE_DISK_FULL = "STORAGE_DISK_FULL",              // 磁盘空间不足
+  STORAGE_PERMISSION_DENIED = "STORAGE_PERMISSION_DENIED",// 文件权限拒绝
+  STORAGE_PATH_TOO_LONG = "STORAGE_PATH_TOO_LONG",      // 路径超长
+  EXPORT_TIMEOUT = "EXPORT_TIMEOUT",                    // 导出超时
+  EXPORT_FFMPEG_FAILED = "EXPORT_FFMPEG_FAILED",        // FFmpeg 合成失败
+
+  // ─── 校验错误 ─── DMVideo 对应: ValueError 参数校验
+  VALIDATION_FAILED = "VALIDATION_FAILED",              // 通用校验失败
+  VALIDATION_PARAM_INVALID = "VALIDATION_PARAM_INVALID",// 参数无效
+
+  // ─── 通用 ───
   UNKNOWN = "UNKNOWN",
 }
 
+// ─── 增强 AppError（对照 DMVideo HttpError + plan DraftState.error）───
 export interface AppError {
   code: ErrorCode;
-  message: string;  // 中文友好提示
-  detail?: string; // 英文技术细节
-  retryable: boolean;
+  message: string;        // 中文友好提示（如"草稿不存在，请检查草稿路径"）
+  detail?: string;        // 英文技术细节（如"DraftNotFoundException: /path/to/draft"）
+  retryable: boolean;     // 是否可重试
+  retryStrategy?: RetryStrategy;  // 重试策略（可重试时必填）
+  context?: ErrorContext; // 错误上下文
+  cause?: AppError;       // 错误链（底层错误）
+  timestamp: number;      // 错误发生时间戳
+}
+
+export interface ErrorContext {
+  operation: string;      // 触发错误的操作（如 "createDraft", "addMaterial"）
+  params?: Record<string, unknown>; // 操作参数（脱敏后）
+  userId?: string;        // 关联用户
+  sessionId?: string;     // 关联会话
+  draftId?: string;       // 关联草稿
+}
+
+// ─── 分级重试策略（对照 DMVideo 下载重试退避 + ASR MAX_ATTEMPTS）───
+export enum RetryStrategy {
+  NONE = "none",                  // 不重试（校验错误、权限错误）
+  IMMEDIATE = "immediate",        // 立即重试（IPC 超时）
+  EXPONENTIAL_BACKOFF = "exponential_backoff", // 指数退避（AI API 限流、MCP 断线）
+  USER_CONFIRM = "user_confirm",  // 用户确认后重试（素材完整性失败、导出失败）
+  FALLBACK_MODEL = "fallback_model", // 切换模型重试（AI 主模型不可用）
+}
+
+// ─── ErrorCode → RetryStrategy 默认映射 ───
+export const DEFAULT_RETRY_STRATEGY: Partial<Record<ErrorCode, RetryStrategy>> = {
+  [ErrorCode.IPC_TIMEOUT]:                  RetryStrategy.IMMEDIATE,
+  [ErrorCode.IPC_CONNECTION_FAILED]:         RetryStrategy.IMMEDIATE,
+  [ErrorCode.AI_RATE_LIMIT]:                 RetryStrategy.EXPONENTIAL_BACKOFF,
+  [ErrorCode.AI_MODEL_UNAVAILABLE]:          RetryStrategy.FALLBACK_MODEL,
+  [ErrorCode.MCP_CONNECTION_LOST]:           RetryStrategy.EXPONENTIAL_BACKOFF,
+  [ErrorCode.MATERIAL_INTEGRITY_FAILED]:     RetryStrategy.USER_CONFIRM,
+  [ErrorCode.EXPORT_FFMPEG_FAILED]:          RetryStrategy.USER_CONFIRM,
+  [ErrorCode.STORAGE_PERMISSION_DENIED]:     RetryStrategy.USER_CONFIRM,
+  [ErrorCode.VALIDATION_FAILED]:             RetryStrategy.NONE,
+  [ErrorCode.DRAFT_CORRUPTED]:               RetryStrategy.NONE,
 }
 ```
 
-**Simple Retry 流程**：
+**标准错误响应格式（跨层传递）**：
+
+```typescript
+// types/errorResponse.ts — 对照 DMVideo {code: 0, msg, data} 统一格式
+
+// MCP → IPC 标准错误响应
+export interface StandardErrorResponse {
+  success: false;
+  error: {
+    code: ErrorCode;
+    message: string;        // 中文友好提示
+    detail?: string;        // 英文技术细节
+    retryable: boolean;
+    retryStrategy?: RetryStrategy;
+  };
+  meta: {
+    timestamp: number;
+    requestId: string;      // 请求追踪 ID
+    layer: 'mcp' | 'ipc' | 'ui';  // 错误发生层
+  };
+}
+
+// 成功响应（对照 DMVideo {code: 0, message: "success", data}）
+export interface StandardSuccessResponse<T = unknown> {
+  success: true;
+  data: T;
+  meta: {
+    timestamp: number;
+    requestId: string;
+  };
+}
+
+export type StandardResponse<T = unknown> = StandardSuccessResponse<T> | StandardErrorResponse;
+```
+
+**用户侧错误恢复流程（与 P3.4.10 互补）**：
 
 ```
-Tool 调用失败 → 显示友好错误（中文）→ 询问用户是否重试
-                                    │
-                    ┌───────────────┴───────────────┐
-                    ↓                               ↓
-                  重试                           跳过
-                    │                               │
-              重新执行 Tool                    继续后续流程
+P3.4.10 内部恢复（自动，用户不可见）       P4.3.9 用户侧恢复（用户参与）
+┌──────────────────────────┐              ┌──────────────────────────┐
+│ Reactive Compact          │              │ 内部恢复全部失败时触发    │
+│ Fallback Model            │              │                          │
+│ Withholding               │              │ 1. 分级重试策略选择       │
+│                           │              │ 2. 用户确认对话框         │
+│ 成功 → 用户无感知继续      │──失败──→    │ 3. 恢复建议展示          │
+│ 失败 → 交给 P4.3.9       │              │ 4. 用户选择重试/跳过/取消 │
+└──────────────────────────┘              └──────────────────────────┘
+
+用户侧恢复流程：
+Tool 调用失败（P3.4.10 内部恢复已耗尽）
+    │
+    ├── retryStrategy=IMMEDIATE → 自动重试 1 次 → 仍失败则提示用户
+    ├── retryStrategy=EXPONENTIAL_BACKOFF → 自动重试 3 次（间隔 1s/2s/4s）→ 仍失败则提示
+    ├── retryStrategy=FALLBACK_MODEL → 切换模型重试 → 仍失败则提示
+    ├── retryStrategy=USER_CONFIRM → 直接弹出确认对话框
+    └── retryStrategy=NONE → 仅展示错误，不提供重试
+
+用户确认对话框：
+┌──────────────────────────────────────────────┐
+│  ⚠️ 操作失败                                  │
+│                                              │
+│  草稿导出失败：FFmpeg 合成超时                 │
+│  建议：关闭其他占用 CPU 的程序后重试           │
+│                                              │
+│  [重试]    [跳过]    [查看详情]               │
+└──────────────────────────────────────────────┘
+```
+
+**错误日志格式**：
+
+```typescript
+// core/telemetry/errorLogger.ts — 对照 DMVideo logger.httpError 结构化日志
+
+interface ErrorLogEntry {
+  timestamp: string;           // ISO 8601
+  level: 'error' | 'warn';
+  code: ErrorCode;
+  message: string;
+  detail?: string;
+  context: ErrorContext;
+  // 聚合字段
+  fingerprint: string;         // code + operation 哈希，用于错误去重和聚合统计
+}
+
+// 写入位置：electron.app.getPath('userData') / logs / error-{date}.log
+// 保留策略：保留最近 30 天日志
+```
+
+**Toast 通知规范**：
+
+```typescript
+// components/common/ToastNotification.vue
+
+type ToastType = 'error' | 'warning' | 'info' | 'success';
+
+interface ToastOptions {
+  type: ToastType;
+  message: string;             // 中文友好提示
+  duration?: number;           // 自动消失时间（ms），error 默认不自动消失
+  action?: {
+    label: string;             // 操作按钮文案（如"重试"、"查看"）
+    handler: () => void;       // 点击回调
+  };
+}
+
+// 使用示例：
+// toast.error({ message: '素材导入失败：文件格式不支持', action: { label: '重试', handler: retry } })
+// toast.warning({ message: '磁盘空间不足，剩余 500MB', duration: 5000 })
 ```
 
 ---
@@ -3441,40 +5233,54 @@ dist/
 
 ---
 
-#### Phase 4 任务总览（21 tasks）
+#### Phase 4 任务总览（43 tasks）
 
 | Phase | 任务数 | 核心交付 |
 |-------|--------|----------|
 | P4.1 核心 ReAct 循环测试 | 6 | E2E 测试通过，沙盒验证 |
-| P4.2 素材路径处理优化 | 3 | Windows 路径工具 + 统一解析 |
-| P4.3 错误处理与提示 | 5 | ErrorCode + 友好提示 + Simple Retry |
+| P4.2 素材路径体系 | 11 | 跨平台路径核心 + 剪映映射 + 安全校验 + 存在性检查 + 目录发现 + 变更监听 |
+| P4.3 错误处理与提示 | 11 | 6 领域 ErrorCode + 标准响应格式 + 日志 + Error Boundary + Toast + 分级重试 + 校验错误 |
 | P4.4 @素材引用 | 2 | @触发自动完成 + 引用解析渲染 |
 | P4.5 Windows 打包发布 | 5 | .exe 安装包 + Key 配置界面 |
-| **合计** | **21** | 可发布 Windows 版本 |
+| **合计** | **43** | 可发布 Windows 版本 |
 
 ---
 
 #### Phase 4 开发顺序（2 轮迭代）
 
 ```
-第1轮迭代（测试 + 路径 + 错误）
+第1轮迭代（测试 + 路径基础 + 错误基础）
 ├── P4.1.1 沙盒测试环境
 ├── P4.1.2 QueryEngine 单测
 ├── P4.1.3 ToolExecutor 单测
-├── P4.2.1 Windows 路径工具
-├── P4.2.2 MCP 路径校验
-├── P4.3.1 ErrorCode 枚举
-├── P4.3.2 MCP 错误转换
-├── P4.3.4 REPL 错误展示
-├── P4.3.5 Simple Retry
+├── P4.2.1 跨平台路径核心工具
+├── P4.2.2 剪映 JSON 路径映射
+├── P4.2.3 路径安全与边界校验
+├── P4.2.4 中文/Unicode 路径处理
+├── P4.2.5 文件名清理与大小写
+├── P4.2.6 素材存在性校验
+├── P4.2.7 剪映草稿目录发现
+├── P4.3.1 ErrorCode 枚举（6 大领域）
+├── P4.3.2 标准错误响应格式
+├── P4.3.3 MCP 错误转换
+├── P4.3.5 错误日志基础设施
+├── P4.3.6 Vue Error Boundary
 └── P4.4.1 @素材自动完成
 
-第2轮迭代（集成 + 打包 + 引用）
+第2轮迭代（路径集成 + 错误体验 + 打包 + 引用）
 ├── P4.1.4 IPC 通道测试
 ├── P4.1.5 权限流程测试
 ├── P4.1.6 E2E ReAct 循环
-├── P4.2.3 Electron 路径统一
-├── P4.3.3 IPC 错误传递
+├── P4.2.8 路径变更监听与引用更新
+├── P4.2.9 缩略图路径生成
+├── P4.2.10 MCP 路径校验增强
+├── P4.2.11 Electron 集成层
+├── P4.3.4 IPC 错误传递
+├── P4.3.7 全局错误 Store + Toast
+├── P4.3.8 分场景错误展示组件
+├── P4.3.9 用户侧错误恢复体验
+├── P4.3.10 校验错误格式与展示
+├── P4.3.11 错误处理集成测试
 ├── P4.4.2 素材引用解析渲染
 ├── P4.5.1 electron-builder 配置
 ├── P4.5.2 Windows x64 构建
