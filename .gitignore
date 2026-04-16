@@ -12,7 +12,6 @@ src/utils/vendor/
 
 # AI tool runtime directories
 .agents/
-.claude/
 .codex/
 .omx/
 

@@ -1,26 +1,24 @@
 # JY Draft 技术方案
 
-> 更新时间：2026-04-15
+> 更新时间：2026-04-16
 
 ## 需求理解
 
 ### 用户场景
 - 用户通过自然语言描述想要的视频内容
 - 用户本地上传视频/音频/图片素材
-- AI Agent 自动编排素材，生成剪映草稿 JSON
-- 用户可在剪映中打开编辑，或通过 MCP 调用剪映能力
+- AI Agent 自动编排素材（通过调用MCP Server 工具），生成剪映草稿 JSON
 
 ### 核心功能
 1. **自然语言交互** — 用户描述视频需求
 2. **本地素材管理** — 用户上传/选择本地素材（Windows本地路径如 `E:\device.png`）
-3. **AI 编排** — Agent 理解意图，调用 Tools 生成草稿
-4. **剪映集成** — 通过 MCP 调用剪映能力
+3. **AI 编排** — Agent 理解意图，调用 Tools 生成草稿（基于调用MCP Server）
 
-### 核心功能范围（Phase 1）
+### 核心功能范围
 - ✅ 视频素材添加
 - ✅ 音频素材添加
 - ✅ 文本/字幕添加
-- ✅ 贴纸、特效、滤镜、关键帧
+- ✅ 特效、滤镜、关键帧
 - ✅ TTS 语音合成（bailian，已对接）
 - ✅ 语音识别（bailian，用于语音指令和字幕生成）
 
@@ -36,14 +34,36 @@
    - 自然语言 → 语义搜索素材
 
 ### 素材存储
-- 用户创建本地文件夹
-- 按业务分子文件夹：`/<yyyy-mm-dd>/` 存放素材（视频、图片、音频）
+- 用户手动指定素材根目录
+- 按素材类型分子文件夹：`/videos/` `/audios/` `/images/`
 - 后期可扩展云端同步
 
+### 素材检索
+- 混合搜索策略：素材标签 + 语义向量
+- 标签生成：AI自动分析生成 + 用户手动填写双模式
+- 向量数据库：用于语义匹配素材
+
+### 需求描述流程（双模式）
+1. **AI引导模式**：用户上传视频素材 → 点击视频分析 → AI主动询问细节 → 生成合适的提示词 → 交由多模态大模型分析 → 得到视频描述
+2. **手动填写模式**：用户直接手动填写视频描述
+
+### 素材缺失处理策略（用户自选）
+- 暂停等待：告知用户缺什么素材，等用户补充后再继续
+- AI占位符：用AI生成的占位内容（如空白视频/静音音频）代替
+- 跳过替代：自动跳过找不到的素材，只用能匹配上的素材
+
+### 草稿输出
+- 直接输出到剪映工程目录（用户手动指定路径）
+- 生成后跳转剪映打开，App内不做编辑
+
+### 版本历史
+- 手动保存版本（按钮 + 快捷键）
+- 用于回滚：不满意可回退到之前的版本
+- 多草稿支持：可管理多个草稿
+
 ### 用户认证
-- 现阶段：QQ 扫码登录
-- 后端已上线，有完整参考代码
-- 后期实现时提供对接文档
+- 先匿名使用（第一阶段不实现）
+- 后期：QQ 扫码登录（后端已上线，有完整参考代码）
 
 ### 权限控制
 - 敏感操作需用户确认
@@ -57,8 +77,8 @@
 ### GUI 界面功能
 - 草稿列表 + 素材管理
 - AI 对话（增强 REPL）
-- 预览窗口 + 时间线编辑
-- 特效面板 + 多轨编辑
+- 生成后跳转到剪映打开（App内不做编辑）
+- 不需要草稿预览功能
 
 ### 草稿 JSON 结构
 - 分层支持：核心字段必填，高级字段可选
@@ -88,53 +108,739 @@
 ### 离线支持
 - 必须在线（所有功能需要网络连接）
 
+### 错误处理
+- AI生成失败（如API超时）：记录失败任务
+- 用户可手动重试或查看失败原因
+- 不自动无限重试
+
+### 技术风险评估
+- **最大风险**：MCP协议对接（MCP Server和Electron的集成复杂度）
+- 剪映工程目录格式可能有版本差异
+- AI视频理解结果的准确性
+- 向量检索可能匹配到不相关素材
+
+### Phase 1 核心交付
+- **可调用的MCP Server**：DMVideo backend封装成MCP Tools，可被Claude Code调用
+- 验证端到端草稿生成流程
+- 本地一体化部署（MCP Server和Electron打包在一起）
+
 ---
 
 ## 技术架构
 
-### 整体架构（参考 Claude Code）
+> 借鉴 Claude Code 五层架构模型，按职责分离原则重新组织。MCP Server 作为 Sidecar 进程独立于五层之外。
+>
+> **参考文档（Claude Code 架构深度解析）**：
+> 1. [五层架构全景](https://ccb.agent-aura.top/docs/introduction/architecture-overview) — 架构分层与数据流
+> 2. [Agentic Loop](https://ccb.agent-aura.top/docs/conversation/the-loop) — AI 自主循环核心机制
+> 3. [多轮对话管理](https://ccb.agent-aura.top/docs/conversation/multi-turn) — QueryEngine 会话编排与持久化
+> 4. [工具系统设计](https://ccb.agent-aura.top/docs/tools/what-are-tools) — AI 如何从说到做
+> 5. [子 Agent 机制](https://ccb.agent-aura.top/docs/agent/sub-agents) — AgentTool 执行链路与隔离架构
+> 6. [System Prompt 动态组装](https://ccb.agent-aura.top/docs/context/system-prompt) — AI 工作记忆构建
+> 7. [项目记忆系统](https://ccb.agent-aura.top/docs/context/project-memory) — 文件级跨对话记忆架构
+> 8. [上下文压缩](https://ccb.agent-aura.top/docs/context/compaction) — Compaction 三层策略与边界机制
+> 9. [Token 预算管理](https://ccb.agent-aura.top/docs/context/token-budget) — 上下文窗口动态计算
+> 10. [权限模型](https://ccb.agent-aura.top/docs/safety/permission-model) — Allow/Ask/Deny 三级权限体系
+
+### 架构全景
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Layer 1 — 交互层 (Interaction Layer)                               │
+│  ┌─────────────┐  ┌──────────────┐  ┌──────────────┐  ┌─────────┐ │
+│  │ ChatWindow  │  │ MessageList  │  │ PromptInput  │  │ Draft   │ │
+│  │  (对话窗口)  │  │ (消息渲染)   │  │ (用户输入)    │  │ Card    │ │
+│  └─────────────┘  └──────────────┘  └──────────────┘  └─────────┘ │
+│  ┌─────────────┐  ┌──────────────┐  ┌──────────────┐              │
+│  │ Material    │  │ Permission   │  │ Pinia Stores │              │
+│  │ Panel       │  │ Prompt       │  │ (响应式状态)  │              │
+│  └─────────────┘  └──────────────┘  └──────────────┘              │
+├─────────────────────────────────────────────────────────────────────┤
+│  Layer 2 — 编排层 (Orchestration Layer)                             │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │  QueryEngine                                                   │ │
+│  │  ┌──────────┐  ┌──────────┐  ┌───────────┐  ┌──────────────┐ │ │
+│  │  │ 会话管理  │  │ 费用追踪  │  │ 版本快照   │  │ 模型热切换   │ │ │
+│  │  └──────────┘  └──────────┘  └───────────┘  └──────────────┘ │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+├─────────────────────────────────────────────────────────────────────┤
+│  Layer 3 — 核心循环层 (Core Loop Layer)                             │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │  Agentic Loop: while(true) {                                   │ │
+│  │    ① 上下文预处理 → ② 流式 AI 请求 → ③ Tool 执行 → ④ 终止判断 │ │
+│  │  }                                                             │ │
+│  │  ┌──────────┐  ┌──────────────┐  ┌─────────────┐             │ │
+│  │  │ State    │  │ Compaction   │  │ Token       │             │ │
+│  │  │ Object   │  │ (三层压缩)   │  │ Budget      │             │ │
+│  │  └──────────┘  └──────────────┘  └─────────────┘             │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│  Multi-Agent 子系统（横切 Layer 3 + Layer 4）                        │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │  AgentTool                                                      │ │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────────┐ │ │
+│  │  │ Explore  │ │ Draft    │ │ Material │ │ Audio / Plan /   │ │ │
+│  │  │ Agent    │ │ Builder  │ │ Analyst  │ │ Fork Agents      │ │ │
+│  │  └──────────┘ └──────────┘ └──────────┘ └──────────────────┘ │ │
+│  │  独立工具池 · 独立权限 · 独立 System Prompt · 同步/异步执行     │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+├─────────────────────────────────────────────────────────────────────┤
+│  Layer 4 — 工具层 (Tool Layer)                                      │
+│  ┌──────────────────┐  ┌────────────────┐  ┌────────────────────┐ │
+│  │ Local Tools      │  │ MCP Client     │  │ Permission System  │ │
+│  │ ┌──────────────┐ │  │ (Tool Proxy)   │  │ (工具权限管控)      │ │
+│  │ │MaterialMgr   │ │  └───────┬────────┘  └────────────────────┘ │
+│  │ │DraftManager  │ │          │                                   │
+│  │ │AI Tools      │ │          │                                   │
+│  │ │(TTS/ASR/视觉)│ │          │                                   │
+│  │ └──────────────┘ │          │                                   │
+│  └──────────────────┘          │                                   │
+├────────────────────────────────┼────────────────────────────────────┤
+│  Layer 5 — 通信层 (Communication Layer)                             │
+│  ┌──────────────┐  ┌───────────┴──┐  ┌─────────────────────────┐ │
+│  │ AI Provider  │  │ MCP HTTP/SSE │  │ System Prompt           │ │
+│  │ Adapter      │  │ Client       │  │ Assembler               │ │
+│  │(bailian/GLM/ │  │              │  │ (动态组装 + 缓存)        │ │
+│  │ MiniMax)     │  │              │  │                         │ │
+│  └──────────────┘  └──────────────┘  └─────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                            ┌───────┴────────┐
+                            │  MCP Server    │  ← Sidecar 进程
+                            │ (DMVideo改造)  │     独立于五层之外
+                            │ Python 后端    │
+                            └───────┬────────┘
+                                    │
+                            ┌───────┴────────┐
+                            │ 剪映草稿 JSON  │
+                            │ (文件输出)     │
+                            └───────────────┘
+```
+
+### Layer 1 — 交互层 (Interaction Layer)
+
+> 参考：Claude Code REPL Screen (`src/screens/REPL.tsx`)
+
+Vue 3 渲染进程，负责用户输入、消息展示、素材管理和权限确认。
+
+**核心组件**：
+
+| 组件 | 职责 | 参考 Claude Code |
+|------|------|------------------|
+| ChatWindow | 对话主窗口，布局管理 | REPL.tsx (root screen) |
+| MessageList | 消息流渲染（用户/助手/工具/系统） | Messages.tsx / MessageRow.tsx |
+| PromptInput | 用户输入区（文本 + 快捷键） | PromptInput/ |
+| DraftCard | 草稿状态卡片（实时预览） | — (JY Draft 独有) |
+| MaterialPanel | 素材管理面板（上传/预览/管理） | — (JY Draft 独有) |
+| PermissionPrompt | 工具权限确认弹窗 | permissions/ |
+
+**Pinia Store 设计**：
+```typescript
+// 会话 Store
+const useConversationStore = defineStore('conversation', {
+  state: () => ({
+    messages: Message[],           // 对话消息列表
+    isStreaming: boolean,          // AI 是否正在输出
+    activeDraftId: string | null,  // 当前活跃草稿
+  }),
+})
+
+// 素材 Store
+const useMaterialStore = defineStore('material', {
+  state: () => ({
+    materials: Material[],         // 已导入素材列表
+    selectedIds: string[],         // 当前选中素材
+  }),
+})
+
+// 权限 Store
+const usePermissionStore = defineStore('permission', {
+  state: () => ({
+    allowedTools: Set<string>,     // 已授权工具
+    deniedTools: Set<string>,      // 已拒绝工具
+    pendingPrompt: PermissionPrompt | null,  // 待确认请求
+  }),
+})
+```
+
+**IPC 通信**：Renderer 通过 Electron IPC 与 Main Process 的 QueryEngine 交互，所有 AI 调用、Tool 执行均在 Main Process 完成。
+
+---
+
+### Layer 2 — 编排层 (Orchestration Layer)
+
+> 参考：Claude Code QueryEngine (`src/QueryEngine.ts`)
+
+Electron Main Process 中的核心编排器，管理会话生命周期。
+
+**QueryEngine 职责**：
+
+| 能力 | 说明 | 参考 Claude Code |
+|------|------|------------------|
+| 会话管理 | submitMessage() 作为 AsyncGenerator，驱动完整对话周期 | QueryEngine.submitMessage() |
+| 持久化 | 会话转写存储到 SQLite + JSONL，支持会话恢复 | JSONL transcript 持久化 |
+| 费用追踪 | 按模型统计 token 消耗和 API 成本 | cost tracking per model |
+| 版本快照 | 草稿 JSON 修改前后快照，支持 diff 和回滚 | file history snapshots |
+| 模型热切换 | 对话中途可切换 bailian/GLM/MiniMax | model hot-swap |
+
+**会话持久化结构**：
+```
+~/.jy-draft/
+├── sessions/
+│   ├── {session-id}.jsonl     # 会话转写（每行一条消息/事件）
+│   └── {session-id}.meta.json # 会话元数据（模型、费用、时间）
+├── drafts/
+│   ├── {draft-id}/
+│   │   ├── current.json       # 当前草稿 JSON
+│   │   └── snapshots/         # 版本快照
+│   │       ├── v1.json
+│   │       └── v2.json
+└── materials/
+    └── index.db               # SQLite 素材索引
+```
+
+---
+
+### Layer 3 — 核心循环层 (Core Loop Layer)
+
+> 参考：Claude Code Agentic Loop (`src/query.ts` queryLoop())
+
+AI Agent 的自主循环引擎，每一轮迭代包含四个阶段。
+
+**循环结构**：
+```
+while (true) {
+  ① 上下文预处理 (Context Preprocessing)
+     → token 预算计算 → 压缩决策 → system prompt 组装
+  ② 流式 AI 请求 (Streaming API Call)
+     → Provider Adapter 发送请求 → 流式接收文本/Tool 调用
+  ③ Tool 执行 (Tool Execution)
+     → 权限校验 → 执行 Tool → 收集结果
+  ④ 终止判断 (Termination Check)
+     → 无 Tool 调用 → 结束并返回
+     → 有 Tool 调用 → 携带结果回到 ①
+}
+```
+
+**State Object**：每次迭代携带的不可变状态快照，包含当前草稿 ID、素材列表、对话历史引用等，在迭代间安全传递。
+
+**终止条件**（参考 Claude Code 7 种终止条件）：
+- AI 返回纯文本（无 Tool 调用）→ 正常结束
+- 达到最大迭代次数限制 → 强制结束
+- 用户主动中断 → 取消结束
+- Tool 执行抛出不可恢复错误 → 异常结束
+- Token 预算耗尽 → 降级结束
+
+**上下文压缩 — 三层策略**（参考 Claude Code Compaction）：
+
+| 层级 | 策略 | 触发条件 | 说明 |
+|------|------|----------|------|
+| L1 | MicroCompact | 单轮对话过长 | 压缩早期 Tool 调用结果（保留摘要） |
+| L2 | Session Compact | 累计 token 接近阈值 | 对历史对话做摘要压缩 |
+| L3 | API Summary | 紧急降级 | 调用 AI 生成整段对话的紧凑摘要 |
+
+**Token 预算管理**（参考 Claude Code Token Budget）：
+
+```
+┌───────────────────────────────────────────────────┐
+│                  上下文窗口 (模型决定)              │
+│  ┌─────────────────┬──────────────┬──────────────┐│
+│  │  System Prompt   │  压缩后的    │  输出 Token  ││
+│  │  (动态组装)      │  对话历史    │  槽位        ││
+│  └─────────────────┴──────────────┴──────────────┘│
+│                                                   │
+│  阈值：                                           │
+│  ├─ 警告线 (~83%)  → 触发 L1 MicroCompact         │
+│  ├─ 压缩线 (~90%)  → 触发 L2 Session Compact      │
+│  └─ 阻塞线 (~98%)  → 触发 L3 API Summary          │
+└───────────────────────────────────────────────────┘
+```
+
+---
+
+### Layer 4 — 工具层 (Tool Layer)
+
+> 参考：Claude Code Tool System (`src/tools.ts`, `src/tools/`)
+
+统一的 Tool 接口和注册机制，包含本地工具和 MCP 代理工具。
+
+**统一 Tool 接口**：
+```typescript
+interface JYTool {
+  name: string;                          // 工具名称
+  description: string;                   // 工具描述（供 AI 理解）
+  inputSchema: JSONSchema;               // 输入参数 Schema
+  call(input: unknown): Promise<ToolResult>;  // 执行函数
+  validateInput?(input: unknown): ValidationResult;  // 输入校验
+  checkPermissions?(input: unknown): PermissionResult; // 权限检查
+}
+```
+
+**本地工具（Electron Main Process 直接执行）**：
+
+| 工具 | 职责 | 是否需权限 |
+|------|------|-----------|
+| upload_local_material | 导入本地素材到素材库 | 是（文件访问） |
+| list_local_materials | 列出已导入素材 | 否 |
+| tts_generate | TTS 语音合成（bailian） | 是（API 调用） |
+| speech_recognize | 语音识别（bailian） | 是（API 调用） |
+| analyze_video | 视频分析（AI 视觉） | 是（API 调用） |
+| get_draft_state | 获取当前草稿状态 | 否 |
+
+**MCP 代理工具（通过 MCP Client 转发到 MCP Server）**：
+
+| 工具 | 职责 | 所在位置 |
+|------|------|---------|
+| create_draft | 创建新草稿 | MCP Server |
+| add_videos | 添加视频素材到时间线 | MCP Server |
+| add_audios | 添加音频到时间线 | MCP Server |
+| add_texts | 添加文字/字幕 | MCP Server |
+| add_stickers | 添加贴纸 | MCP Server |
+| add_video_effects | 添加视频特效 | MCP Server |
+| add_video_filters | 添加视频滤镜 | MCP Server |
+| add_keyframes | 添加关键帧动画 | MCP Server |
+| add_audio_effects | 添加音频特效 | MCP Server |
+| save_draft | 保存草稿 JSON 到文件 | MCP Server |
+
+**权限系统**（参考 Claude Code Permission System — Allow/Ask/Deny 三级体系）：
+
+> 参考文档：[权限模型](https://ccb.agent-aura.top/docs/safety/permission-model)
+
+#### 1. 三种权限行为
+
+每次 Tool 调用，权限系统做出三种裁决之一：
+
+| 行为 | 含义 | 典型场景（JY Draft） |
+|------|------|---------------------|
+| **Allow** | 自动放行，用户无感知 | `list_local_materials` 查询素材列表 |
+| **Ask** | 弹出确认对话框 | `add_videos` 添加视频到时间线 |
+| **Deny** | 直接拒绝 | 尝试删除草稿文件 |
+
+```typescript
+type PermissionBehavior = 'allow' | 'ask' | 'deny'
+
+interface PermissionResult {
+  behavior: PermissionBehavior
+  updatedInput?: unknown       // Allow 时可能修正参数
+  message?: string             // Ask/Deny 时的提示信息
+  suggestions?: string[]       // Ask 时提供的快捷选项
+  decisionReason?: string      // 决策原因（用于调试）
+}
+```
+
+#### 2. 权限规则的来源层级
+
+规则从 5 个来源汇聚，优先级从高到低：
+
+```
+1. session    — 用户在当前对话中手动授权（"总是允许"）
+2. skill      — Skill 工具的 allowedTools 白名单
+3. projectCfg — 项目级配置 .jy-draft/settings.json（团队共享）
+4. userCfg    — 用户级配置 ~/.jy-draft/settings.json（跨项目）
+5. builtIn    — 内置默认规则（不可覆盖）
+```
+
+每个来源维护三个数组：`allowRules`、`askRules`、`denyRules`。
+
+```typescript
+interface PermissionRule {
+  source: 'session' | 'skill' | 'projectCfg' | 'userCfg' | 'builtIn'
+  behavior: PermissionBehavior
+  rule: {
+    toolName: string           // 如 "add_videos"、"mcp__draft"
+    ruleContent?: string       // 如 "mp4"、"drafts/**"
+  }
+}
+```
+
+#### 3. 规则匹配引擎（三维度）
+
+**维度 1 — 工具名匹配**：
+
+```
+rule "add_videos"        → 精确匹配 add_videos 工具
+rule "mcp__draft"        → 匹配 MCP Server draft 的所有工具
+rule "mcp__draft__*"     → 通配符匹配（同上）
+```
+
+**维度 2 — 参数模式匹配**（按工具类型）：
+
+```
+// 素材操作工具：匹配素材类型
+{ toolName: "add_videos", ruleContent: "*.mp4" }  → 匹配 MP4 素材
+
+// 草稿操作工具：匹配草稿路径
+{ toolName: "save_draft", ruleContent: "drafts/**" }  → 匹配草稿目录下操作
+
+// API 调用工具：匹配 API 端点
+{ toolName: "tts_generate", ruleContent: "bailian/*" }  → 匹配 bailian TTS
+```
+
+**维度 3 — MCP Server 级别匹配**：
+
+```
+rule "mcp__draft__*"     → Draft Server 所有工具
+rule "mcp__effects__*"   → Effects Server 所有工具
+```
+
+#### 4. 权限检查完整流程
+
+```
+Tool 调用请求
+  │
+  ├─ 1. Blanket deny 检查
+  │     getDenyRule(toolName) → 命中 → deny
+  │
+  ├─ 2. Blanket allow 检查
+  │     getAllowRule(toolName) → 命中 → allow
+  │
+  ├─ 3. 工具自身 checkPermissions()
+  │     各工具有自定义逻辑：
+  │     - upload_local_material: 文件路径白名单检查
+  │     - tts_generate: API 配额检查
+  │     - save_draft: 草稿路径检查
+  │     - analyze_video: API 调用成本提示
+  │     ↓ 返回 PermissionResult
+  │
+  ├─ 4. Ask 规则检查
+  │     getAskRules() → 命中 → ask
+  │
+  └─ 5. 默认行为
+        根据当前 permissionMode 决定：
+        - 'default': 敏感操作逐一确认
+        - 'plan':    只能读不能写
+        - 'bypass':  全部放行（需显式启用）
+```
+
+#### 5. 权限模式
+
+| 模式 | 适用场景 | 行为 | 切换方式 |
+|------|---------|------|---------|
+| **Default** | 日常使用 | 敏感操作逐一确认 | 默认模式 |
+| **Plan Mode** | 探索阶段 | 只能查看素材/草稿，不能修改 | 自动（进入规划时） |
+| **Bypass** | 完全信任 | 所有操作自动放行 | `--dangerously-skip-permissions` |
+
+Plan Mode 切换逻辑：
+
+```typescript
+// 进入 Plan Mode 时：切换为只读权限
+function enterPlanMode(state: AppState): AppState {
+  return {
+    ...state,
+    permissionMode: 'plan',
+    // 写操作全部 deny，读操作自动 allow
+  }
+}
+
+// 退出 Plan Mode 时：恢复之前的权限模式
+function exitPlanMode(state: AppState, prevMode: PermissionMode): AppState {
+  return { ...state, permissionMode: prevMode }
+}
+```
+
+#### 6. Denial Tracking（死循环防护）
+
+```typescript
+const DENIAL_LIMITS = {
+  maxDenialsPerTool: 3,       // 同一工具连续拒绝上限
+  cooldownPeriodMs: 30_000,   // 冷却期 30 秒
+}
+```
+
+当 AI 连续被拒绝同一操作达到上限时：
+1. `recordDenial()` 记录拒绝，增加计数
+2. `shouldFallbackToPrompting()` 检测到连续拒绝
+3. 系统向 AI 注入消息："上次工具调用被拒绝，请改变策略"
+4. AI 被迫改变策略，避免反复请求被拒操作
+
+操作成功时调用 `recordSuccess()` 重置计数。
+
+#### 7. JY Draft 场景下的默认权限矩阵
+
+| 工具 | Default 模式 | Plan 模式 |
+|------|-------------|----------|
+| `list_local_materials` | Allow | Allow |
+| `get_draft_state` | Allow | Allow |
+| `upload_local_material` | **Ask** | Deny |
+| `add_videos` | **Ask** | Deny |
+| `add_audios` | **Ask** | Deny |
+| `add_texts` | Allow | Deny |
+| `add_stickers` | Allow | Deny |
+| `add_video_effects` | **Ask** | Deny |
+| `save_draft` | **Ask** | Deny |
+| `tts_generate` | **Ask** | Deny |
+| `speech_recognize` | **Ask** | Deny |
+| `analyze_video` | **Ask** | Deny |
+| `create_draft` | **Ask** | Deny |
+
+---
+
+### Multi-Agent 子系统
+
+> 参考：Claude Code AgentTool (`src/tools/AgentTool/`, `src/tools/AgentTool/runAgent.ts`)
+>
+> 参考文档：[子 Agent 机制](https://ccb.agent-aura.top/docs/agent/sub-agents) — AgentTool 执行链路与隔离架构
+
+横切于 Layer 3（核心循环层）和 Layer 4（工具层）的子系统。主 Agent 通过 `AgentTool` 派发子 Agent 执行专业任务，子 Agent 拥有独立的工具池、权限上下文和 System Prompt。
+
+#### 1. Agent 架构总览
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      Electron App                           │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
-│  │   REPL UI   │  │   State     │  │   Permission        │ │
-│  │  (交互界面)  │  │  Management │  │   System           │ │
-│  └──────┬──────┘  └──────┬──────┘  └──────────┬──────────┘ │
-│         │                │                     │             │
-│  ┌──────┴────────────────┴─────────────────────┴──────────┐ │
-│  │                    QueryEngine                          │ │
-│  │              (对话管理 + Tool 调用编排)                  │ │
-│  └──────┬────────────────────────────────────────┬────────┘ │
-│         │                                        │           │
-│  ┌──────┴──────┐                          ┌───────┴────────┐ │
-│  │   Tools    │                          │   MCP Client  │ │
-│  │  (本地操作) │                          │               │ │
-│  └────────────┘                          └───────┬────────┘ │
-│                                                   │           │
-└───────────────────────────────────────────────────┼───────────┘
-                                                    │
-                                            ┌───────┴────────┐
-                                            │   MCP Server   │
-                                            │ (DMVideo改造)  │
-                                            └───────┬────────┘
-                                                    │
-                                            ┌───────┴────────┐
-                                            │ 剪映草稿生成   │
-                                            │ (JSON输出)     │
-                                            └───────────────┘
+│                    主 Agent (Orchestrator)                    │
+│  ┌─────────────────────────────────────────────────────────┐ │
+│  │  Agentic Loop                                          │ │
+│  │  用户意图 → 分解任务 → 选择 Agent → 派发 → 汇总结果    │ │
+│  └──────────────────────┬──────────────────────────────────┘ │
+│                         │ AgentTool.call()                    │
+│          ┌──────────────┼──────────────┐                     │
+│          │              │              │                      │
+│   ┌──────┴──────┐ ┌─────┴──────┐ ┌─────┴──────┐             │
+│   │ Explore     │ │ Draft      │ │ Material   │             │
+│   │ Agent       │ │ Builder    │ │ Analyst    │             │
+│   │ (素材探索)   │ │ Agent      │ │ Agent      │             │
+│   │             │ │ (草稿构建)  │ │ (素材分析)  │             │
+│   └─────────────┘ └────────────┘ └────────────┘             │
+│                         │              │                      │
+│   ┌─────────────┐ ┌─────┴──────┐ ┌─────┴──────┐             │
+│   │ Audio       │ │ Plan       │ │ Fork       │             │
+│   │ Agent       │ │ Agent      │ │ Agent      │             │
+│   │ (音频处理)   │ │ (规划分析)  │ │ (通用分身)  │             │
+│   └─────────────┘ └────────────┘ └────────────┘             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 核心模块
+#### 2. 命名 Agent 定义
 
-#### 1. MCP Server（DMVideo Backend 改造）
+每个专业 Agent 有独立的 System Prompt、工具池和权限模式：
 
-**改造内容**：
-- 将 DMVideo backend API 封装为 MCP Tools
-- 支持：create_draft, add_videos, add_audios, add_texts, add_stickers, save_draft 等
-- 素材来源：本地文件路径 → 上传到可访问地址 或 本地路径直接引用
+```typescript
+interface AgentDefinition {
+  name: string                    // Agent 名称
+  description: string             // 供主 Agent 理解何时使用
+  systemPrompt: string            // Agent 专属 System Prompt
+  tools: string[] | '*''          // 可用工具（'*' 表示全部）
+  permissionMode: PermissionMode  // 独立权限模式
+  requiredMcpServers?: string[]   // 依赖的 MCP Server
+}
+```
 
-**MCP Tools 设计**：
+**JY Draft 专业 Agent 列表**：
+
+| Agent | 职责 | System Prompt 要点 | 专用工具 | 权限模式 |
+|-------|------|-------------------|---------|---------|
+| **ExploreAgent** | 素材探索、项目结构理解 | 专注于信息收集，不修改任何状态 | `list_local_materials`, `get_draft_state`, `analyze_video` | default |
+| **MaterialAnalyst** | 素材分析、质量评估、片段推荐 | 理解视频/音频内容特征，推荐最佳片段 | `analyze_video`, `list_local_materials`, `speech_recognize` | default |
+| **DraftBuilder** | 草稿构建、时间线编排、素材添加 | 专注构建剪映草稿 JSON，优化时间线 | `create_draft`, `add_*`, `save_draft` | acceptEdits |
+| **AudioAgent** | 音频处理、TTS 生成、配乐推荐 | 音频领域的专业处理 | `tts_generate`, `speech_recognize`, `add_audios` | acceptEdits |
+| **PlanAgent** | 任务规划、方案设计、需求拆解 | 分析需求后输出结构化方案，不执行修改 | `get_draft_state`, `list_local_materials` | plan |
+| **ForkAgent** | 通用分身，继承主 Agent 全部能力 | 继承父 Agent 的完整 System Prompt 和对话历史 | `*`（继承父工具池） | 继承父 |
+
+#### 3. 执行链路
+
+一条 `Agent(prompt="分析素材并生成草稿")` 的完整路径：
+
+```
+主 Agent Agentic Loop
+  │
+  ├─ AI 输出 tool_use: { name: "Agent", prompt: "...", subagent_type: "DraftBuilder" }
+  │
+  ├─ AgentTool.call() ← 入口
+  │    ├─ 1. 解析 effectiveType（命名 Agent or Fork）
+  │    ├─ 2. filterDeniedAgents() ← 权限过滤
+  │    ├─ 3. 检查 requiredMcpServers ← MCP 依赖验证（最长等 30s）
+  │    ├─ 4. assembleToolPool(workerPermissionContext) ← 独立组装工具池
+  │    └─ 5. runAgent() ← 核心执行
+  │
+  ├─ runAgent() 内部
+  │    ├─ getAgentSystemPrompt() ← 构建 Agent 专属 System Prompt
+  │    ├─ initializeAgentMcpServers() ← Agent 级 MCP 服务器
+  │    ├─ query() ← 进入子 Agent 的 Agentic Loop
+  │    │    ├─ 消息流逐条 yield
+  │    │    └─ recordSidechainTranscript() ← JSONL 持久化
+  │    └─ 返回执行结果
+  │
+  └─ finalizeAgentTool() ← 结果汇总
+       ├─ 提取文本内容 + usage 统计
+       └─ mapToolResultToToolResultBlockParam() ← 格式化返回主 Agent
+```
+
+#### 4. 两种子 Agent 路径
+
+| 维度 | 命名 Agent（指定 subagent_type） | Fork 子进程（未指定 subagent_type） |
+|------|-------------------------------|----------------------------------|
+| **触发条件** | `subagent_type` 有值 | 用户主动 fork |
+| **System Prompt** | Agent 自身的 `systemPrompt` | 继承主 Agent 的完整 System Prompt |
+| **工具池** | `assembleToolPool()` 独立组装 | 主 Agent 的原始工具池（`useExactTools: true`） |
+| **上下文** | 仅任务描述 prompt | 主 Agent 的完整对话历史 |
+| **权限模式** | Agent 定义的 `permissionMode` | `'bubble'`（上浮到主终端确认） |
+| **用途** | 专业任务委派 | Prompt Cache 命中率优化 |
+
+#### 5. 工具池的独立组装
+
+子 Agent 不继承主 Agent 的工具限制，工具池完全独立组装：
+
+```typescript
+const workerPermissionContext = {
+  ...appState.toolPermissionContext,
+  mode: selectedAgent.permissionMode ?? 'acceptEdits'
+}
+const workerTools = assembleToolPool(workerPermissionContext, appState.mcp.tools)
+```
+
+关键设计决策：
+- **权限模式独立**：子 Agent 使用自身定义的 `permissionMode`，不受主 Agent 当前模式限制
+- **MCP 工具继承**：子 Agent 自动获得所有已连接的 MCP 工具
+- **Agent 级 MCP 服务器**：可为特定 Agent 额外连接专属 MCP 服务器
+
+#### 6. 生命周期管理：同步 vs 异步
+
+**同步 Agent（前台运行）**：
+
+```
+AgentTool.call()
+  └─ runAgent() ← 在主 Agent 的 Agentic Loop 中阻塞等待
+       └─ 返回结果 → 主 Agent 继续下一轮迭代
+```
+
+**异步 Agent（后台运行）**：
+
+```
+AgentTool.call()
+  ├─ registerAsyncAgent() ← 注册到 AppState.tasks
+  └─ runAsyncAgentLifecycle() ← 后台执行（void，火后不管）
+       ├─ runAgent() ← 独立 Agentic Loop
+       ├─ completeAsyncAgent() ← 标记完成
+       └─ enqueueAgentNotification() ← 通知主 Agent
+```
+
+异步 Agent 的特点：
+- 独立的 `AbortController`，不与主 Agent 共享
+- 用户取消主线程不会杀掉后台 Agent
+- 通过 TaskUpdate 工具查询进度
+
+**自动后台化**（超过阈值自动切换）：
+
+```typescript
+const AUTO_BACKGROUND_MS = 120_000  // 默认 120 秒
+// 如果同步 Agent 执行超过 120s，自动转为异步
+```
+
+#### 7. Fork 递归防护
+
+Fork 子进程保留 Agent 工具（为了 cache-identical tool defs），但通过两道防线防止递归 fork：
+
+1. **`querySource` 检查**：检测 `context.options.querySource === 'agent:jy-draft:fork'`
+2. **消息扫描**：检测 fork 启动标签
+
+#### 8. 结果回传格式
+
+```typescript
+// 子 Agent 完成后，结果回传给主 Agent
+interface AgentToolResult {
+  status: 'completed' | 'async_launched'
+  content: string                  // Agent 输出的文本摘要
+  usage: {
+    totalTokens: number
+    toolCalls: number
+    duration: number
+  }
+}
+```
+
+对于一次性 Agent（Explore、Plan），usage 统计被省略以节省上下文窗口。
+
+#### 9. JY Draft 典型协作流程
+
+**场景：用户说"帮我用这5个视频素材做一个旅行 Vlog"**
+
+```
+用户: "帮我用这5个视频素材做一个旅行 Vlog"
+  │
+  ├─ 主 Agent 理解意图 → 分解任务
+  │
+  ├─ 1. ExploreAgent("扫描素材库，列出所有可用的旅行视频")
+  │     └─ list_local_materials() → 返回素材列表
+  │
+  ├─ 2. MaterialAnalyst("分析这5个视频，推荐最佳片段和排列顺序")
+  │     ├─ analyze_video() × 5 → 返回每个视频的精彩片段
+  │     └─ 输出：推荐的时间线排列方案
+  │
+  ├─ 3. AudioAgent("为旅行 Vlog 生成背景音乐和转场音效")
+  │     └─ tts_generate() → 返回音频素材
+  │
+  ├─ 4. DraftBuilder("根据以下方案构建完整草稿：...")
+  │     ├─ create_draft()
+  │     ├─ add_videos() ← 按推荐片段添加
+  │     ├─ add_audios() ← 添加背景音乐
+  │     ├─ add_texts() ← 添加字幕
+  │     └─ save_draft() → 输出草稿 JSON
+  │
+  └─ 主 Agent 汇总结果 → 向用户展示完成报告
+```
+
+---
+
+### Layer 5 — 通信层 (Communication Layer)
+
+> 参考：Claude Code API Layer (`src/services/api/`)
+
+封装所有外部通信，包括 AI Provider API 调用和 MCP 协议通信。
+
+**AI Provider Adapter**：
+
+```
+┌──────────────────────────────────────┐
+│        AI Provider Interface         │
+│  ┌──────────┐  ┌──────────────────┐ │
+│  │ bailian  │  │ GLM              │ │
+│  │ Adapter  │  │ Adapter          │ │
+│  └──────────┘  └──────────────────┘ │
+│  ┌──────────┐                       │
+│  │ MiniMax  │                       │
+│  │ Adapter  │                       │
+│  └──────────┘                       │
+│                                      │
+│  统一能力：                          │
+│  ├─ chat (对话)                      │
+│  ├─ vision (图像理解)                │
+│  ├─ tts (语音合成)                   │
+│  ├─ asr (语音识别)                   │
+│  └─ embedding (向量嵌入)             │
+└──────────────────────────────────────┘
+```
+
+**流式响应处理**：所有 Adapter 统一输出 `AsyncGenerator<StreamEvent>`，核心循环层无需关心具体 Provider 差异。
+
+**MCP HTTP/SSE 通信**：
+- Electron Main Process 作为 MCP Client
+- 通过 HTTP POST 发送请求，SSE 接收响应
+- MCP Server 作为 Sidecar 进程随 Electron 启动/关闭
+
+**System Prompt 动态组装**（参考 Claude Code System Prompt 三阶段管线）：
+
+```
+Stage 1: getSystemPrompt()
+  → 基础身份 + 能力描述 + 工具列表
+
+Stage 2: buildEffectiveSystemPrompt()
+  → 注入当前草稿状态 + 素材上下文 + 用户偏好
+
+Stage 3: buildSystemPromptBlocks()
+  → 转为 API 请求格式 + 标记缓存边界 (DYNAMIC_BOUNDARY)
+```
+
+缓存策略：静态部分（身份、工具描述）标记为可缓存，动态部分（草稿状态、素材列表）每次刷新。
+
+---
+
+### Sidecar — MCP Server
+
+> 独立于五层架构的 Sidecar 进程，由 DMVideo Python 后端改造而来。
+
+**定位**：专注于剪映草稿 JSON 的生成和操作，不处理 AI 推理、不处理 UI。
+
+**核心能力**：
+
 ```typescript
 // 草稿管理
 create_draft(width: number, height: number): draft_id
@@ -150,80 +856,21 @@ add_stickers(draft_id: string, sticker_infos: StickerInfo[]): void
 add_video_effects(draft_id: string, effect_ids: string[][]): void
 add_video_filters(draft_id: string, filter_ids: string[][]): void
 add_keyframes(draft_id: string, keyframe_ids: string[][]): void
-
-// 音频特效
 add_audio_effects(draft_id: string, effect_ids: string[][]): void
-add_audio_keyframes(draft_id: string, keyframe_ids: string[][]): void
 ```
 
-#### 2. Electron 桌面应用
+**部署方式**：
+- 开发模式：独立 Python 进程，stdio 或 HTTP/SSE 通信
+- 生产模式：随 Electron 打包，作为 Sidecar 子进程启动
 
-**前端（Renderer）**：
-- Vue 3 + TypeScript
-- REPL 风格交互界面（参考 Claude Code 的交互体验）
-- 素材管理面板（上传、预览、管理本地素材）
-- 草稿预览/编辑
-- 多语言支持（i18n）
-
-**后端（Main）**：
-- MCP Client 连接
-- 文件系统操作（读取本地素材）
-- Electron IPC 通信
-
-#### 3. QueryEngine（参考 Claude Code）
-
-**职责**：
-- 管理对话状态
-- 解析用户意图
-- 编排 Tool 调用顺序
-- 处理 Tool 结果，返回给用户
-
-#### 4. Tool System
-
-**本地 Tools（MCP Client 调用）**：
-```typescript
-// 素材相关
-upload_local_material(path: string): material_url
-list_local_materials(): Material[]
-
-// AI 素材生成（bailian 平台）
-tts_generate(text: string, voice?: string): AudioResult  // TTS 语音合成
-speech_recognize(audio_path: string): string             // 语音识别
-
-// 草稿相关
-create_draft(config: DraftConfig): draft_id
-save_draft(draft_id: string): draft_url
-
-// 状态相关
-get_draft_state(draft_id: string): DraftState
-update_draft_state(draft_id: string, state: Partial<DraftState>): void
+**数据流**：
 ```
-
-**MCP Tools（通过 MCP 调用 DMVideo）**：
-- 所有 DMVideo backend API 对应的 Tool
-
-#### 5. State Management
-
-**结构**：
-```typescript
-interface JYAppState {
-  currentDraft: DraftState | null;
-  materials: Material[];
-  conversation: Message[];
-  permissions: PermissionState;
-  mcpConnections: MCPConnection[];
-}
+Electron (MCP Client)  →  HTTP/SSE  →  MCP Server (Python)
+                                        ├─ 解析 Tool 参数
+                                        ├─ 调用 DMVideo core 逻辑
+                                        ├─ 生成剪映 JSON
+                                        └─ 返回 JSON 或状态
 ```
-
-**持久化**：
-- 会话状态存储在 `~/.jy-draft/sessions/`
-- 草稿 JSON 存储在 `~/.jy-draft/drafts/`
-
-#### 6. Permission System
-
-参考 Claude Code 的 Tool 权限机制：
-- 敏感操作（如文件上传、网络请求）需要用户确认
-- 支持记住授权/拒绝
 
 ---
 
@@ -249,6 +896,15 @@ interface JYAppState {
 ### Phase 1：MCP Server 改造
 
 > **重要**：基于 `references/DMVideo/backend` 已有业务代码进行开发与增强
+>
+> **审计报告**：[phase1-audit.md](phase1-audit.md) — 基于 `schemas.py` + `router.py` + `main.py` 实际代码的交叉验证结果。
+> 开发时请对照审计报告，重点关注：
+> - 2.4 节遗漏的 14 个 REST 端点（含 4 个 P0 级 modify 操作）
+> - 3.1 节效果添加到草稿的流程断裂问题（建议采用合并方案）
+> - 3.2 节草稿状态读取缺失（需补充 `get_draft_content` + `list_drafts`）
+> - 4 节参数描述不充分（Tool 的 inputSchema 应与 schemas.py 完全对应）
+> - 5.3 节 handlers 拆分建议
+> - 六 节修正后的 34 个 Tool 清单与分阶段实施建议
 
 #### 1.1 技术决策
 
@@ -521,6 +1177,15 @@ python-multipart>=0.0.6
 > - 许可证：闭源，不商用
 > - Vue 视图代码保留但不显示功能页面
 > - SQLite 表结构和加解密逻辑直接继承
+>
+> **审计报告**：[phase2-audit.md](phase2-audit.md) — 基于 DMVideo 前端实际代码（preload.ts 100+ IPC、core/ 20 模块、mcp/index.ts Server）的交叉验证结果。
+> 开发时请对照审计报告，重点关注：
+> - §3.1 IPC 通道设计严重不足（计划 20 个 vs 实际 100+ 个，需重新设计精简方案）
+> - §3.2 MCP 传输协议不一致（计划 HTTP/SSE vs 实际 stdio，需同时支持）
+> - §3.3 已有 Node.js MCP Server（22 个数据访问工具）未纳入计划
+> - §3.4–3.5 目录结构和 core 模块遗漏（pipeline/、ffmpeg/、typings/、httpClient 等 6 个核心依赖）
+> - §3.7 Python MCP Server 进程生命周期管理缺失
+> - §4 架构决策建议（双 MCP 架构 + 精简 IPC + Agent 主进程运行）
 
 #### 2.1 技术决策
 
@@ -530,7 +1195,7 @@ python-multipart>=0.0.6
 | 渲染框架 | Vue 3 + TypeScript（直接复用） |
 | 状态管理 | Pinia（直接复用） |
 | 数据库 | SQLite（继承 `database/index.ts` 表结构 + `tokenAesCrypto` 加解密） |
-| AI 能力 | bailian（直接复用 `core/bailian.ts`） |
+| AI 能力 | bailian（直接复用 `core/bailian.ts`），GLM，Minimax |
 | MCP 通信 | HTTP/SSE（Phase 1 决策） |
 | 主进程职责 | 核心业务逻辑（可编译字节码保护） |
 | REPL 布局 | 底部面板 + 可拖拽调整高度 |
