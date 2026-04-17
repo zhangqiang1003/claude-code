@@ -5113,88 +5113,364 @@ interface ToastOptions {
 
 ---
 
-#### Phase 4.4：聊天窗口 @素材引用（2 tasks）
+#### Phase 4.4：聊天窗口 @素材引用（8 tasks）
 
-> 用户在 REPL 输入框中输入 `@` 时，弹出素材自动完成列表
+> 用户在 REPL 输入框中输入 `@` 时，弹出素材自动完成列表，支持选择→引用→AI 处理全链路
 
 | 编号 | 任务 | 交付物 | 依赖 | 验收标准 |
 |------|------|--------|------|----------|
-| P4.4.1 | @素材自动完成组件 | `components/REPL/MaterialAutocomplete.vue` | P3.4.13, P3.2.13 | 输入 `@` 弹出素材列表，支持模糊搜索 |
-| P4.4.2 | 素材引用解析与渲染 | `utils/materialRef.ts` + `components/REPL/MaterialRef.vue` | P4.4.1 | `@[video:test.mp4]` 正确解析并渲染为可点击引用 |
+| P4.4.1 | @触发检测 Composable | `composables/useMaterialMention.ts` | P3.4.17, P3.2.29 | 检测光标位置 `@` 触发；排除邮箱等误触发；提供 `searchMaterials()`/`insertRef()`/`parseAllRefs()` |
+| P4.4.2 | @素材自动完成组件 | `components/REPL/MaterialAutocomplete.vue` | P4.4.1 | 输入 `@` 弹出素材列表；支持模糊搜索（300ms debounce）；键盘 ↑↓/Enter/Esc/Tab 导航；点击外部关闭 |
+| P4.4.3 | 引用格式定义与解析器 | `utils/materialRef.ts` | P4.4.1 | 解析/序列化/验证三合一；支持 video/audio/image/text/material 5 种类型；正确处理 Windows 路径/空格/中文 |
+| P4.4.4 | 引用渲染组件（消息流） | `components/REPL/MaterialRefTag.vue` + `MaterialRefInline.vue` | P4.4.3 | 用户消息中引用渲染为可点击标签（蓝色高亮 + 类型图标）；AI 消息中素材名自动识别渲染 |
+| P4.4.5 | AI 侧引用处理管道 | `core/queryEngine/materialRefPreprocessor.ts` | P4.4.3, P3.4.13 | QueryEngine 发送前自动展开引用为素材元数据描述；系统提示词包含引用格式说明 |
+| P4.4.6 | 素材引用验证 | `utils/materialRefValidator.ts` | P4.4.3, P4.2.6 | 发送前验证引用素材存在性/格式/软删除状态；验证失败行内提示（非 Toast） |
+| P4.4.7 | @ 与 / 触发器互斥管理 | PromptInput 内 trigger 状态机 | P4.4.1, P4.4.2 | `@` 素材 / `/` skill 互斥弹出；同时只激活一个；Esc 统一关闭 |
+| P4.4.8 | 集成测试 | `__tests__/material-mention/` | P4.4.1~7 | 触发检测 / 模糊搜索 / 键盘导航 / 引用解析 / 多引用 / 验证 / AI 展开 全流程通过 |
 
-**@素材引用交互流程**：
+**@素材引用端到端流程**：
 
 ```
-用户输入 "@" → 弹出素材列表（模糊搜索）→ 选择素材 → 插入引用
-                                                              ↓
-                                                    @[video:E:\test.mp4]
-                                                              ↓
-用户发送消息 → AI 收到引用 → 解析为实际素材信息 → 执行对应 Tool
+用户输入 "@" ─────────────────────────────────────────────────────────
+     │                                                                │
+     ▼                                                                │
+┌─────────────────┐    ┌──────────────────────┐                       │
+│ useMaterialMention│   │ MaterialAutocomplete  │                      │
+│ detectAtTrigger() │──▶│ 浮动下拉列表          │                      │
+│ 排除邮箱误触发    │    │ 素材名+路径+类型图标   │                      │
+└─────────────────┘    │ 300ms debounce 搜索   │                      │
+                       └──────────┬───────────┘                       │
+                                  │ 用户选择（Enter/Tab/Click）         │
+                                  ▼                                    │
+                       ┌──────────────────────┐                       │
+                       │ insertRef() 插入引用   │                      │
+                       │ @{video|test.mp4}     │───────────────────────┘
+                       └──────────┬───────────┘
+                                  │ 用户按 Enter 发送
+                                  ▼
+                    ┌─────────────────────────┐
+         ┌─────────│ materialRefValidator.ts  │─────────┐
+         │         │ 验证存在性/格式/状态       │         │
+         ▼         └─────────────────────────┘         │
+    验证失败                                    验证通过
+    行内错误提示                                      │
+                                                     ▼
+                              ┌───────────────────────────────────┐
+                              │ materialRefPreprocessor.ts         │
+                              │ (QueryEngine 消息预处理)            │
+                              │                                    │
+                              │ 1. parseAllRefs() 解析所有引用       │
+                              │ 2. 查询素材元数据（时长/分辨率/格式） │
+                              │ 3. 展开为结构化描述注入消息上下文     │
+                              │ 4. 系统提示词包含引用格式说明         │
+                              └───────────────────────────────────┘
 ```
 
-**素材引用格式设计**：
+**素材引用格式设计**（改进版，解决原方案解析歧义）：
 
 ```typescript
-// 引用格式
-@[video:E:\videos\test.mp4]
-@[audio:E:\music\bgm.mp3]
-@[text:字幕内容]
-@[material:material_id]
+// ━━━ 引用格式 ━━━
+// 使用 @{type|value} 格式，避免 @[type:path] 的冒号歧义和方括号转义问题
+@{video|test.mp4}              // 按文件名引用（模糊匹配）
+@{video|E:\videos\test.mp4}   // 按绝对路径引用
+@{audio|bgm.mp3}              // 音频素材
+@{image|logo.png}             // 图片素材
+@{text|字幕文本内容}            // 文本素材
+@{material|mat_abc123}        // 按 material_id 引用
 
-// 解析后的消息结构
-interface MessageWithMaterialRef {
-  text: "帮我添加 @[video:E:\test.mp4] 到草稿",
-  materialRefs: [
-    { type: "video", path: "E:\\test.mp4", raw: "@[video:E:\\test.mp4]" }
-  ]
+// ━━━ 解析器接口 ━━━
+interface MaterialRef {
+  type: "video" | "audio" | "image" | "text" | "material"
+  value: string             // 文件名、路径或 material_id
+  raw: string               // 原始文本 @{video|test.mp4}
+  range: [number, number]   // 在原文中的起止位置
+}
+
+interface ParsedMessage {
+  text: string                       // 原始消息文本
+  refs: MaterialRef[]                // 解析出的引用列表
+  plainText: string                  // 替换引用为素材名后的纯文本
+}
+
+// 解析示例
+// 输入："把 @{video|intro.mp4} 放开头，@{audio|bgm.mp3} 做背景音乐"
+// 输出：
+{
+  text: "把 @{video|intro.mp4} 放开头，@{audio|bgm.mp3} 做背景音乐",
+  refs: [
+    { type: "video", value: "intro.mp4", raw: "@{video|intro.mp4}", range: [2, 20] },
+    { type: "audio", value: "bgm.mp3",   raw: "@{audio|bgm.mp3}",   range: [27, 43] },
+  ],
+  plainText: "把 intro.mp4 放开头，bgm.mp3 做背景音乐"
+}
+
+// ━━━ 解析正则 ━━━
+const MATERIAL_REF_REGEX = /@\{(video|audio|image|text|material)\|([^}]+)\}/g
+```
+
+**useMaterialMention Composable 设计**：
+
+```typescript
+// composables/useMaterialMention.ts
+// ━━━ 核心职责：@ 触发检测 + 搜索协调 + 引用插入 ━━━
+
+export function useMaterialMention(options: {
+  textarea: Ref<HTMLTextAreaElement>
+  onInsert?: (ref: string) => void
+}) {
+  // ── 触发检测 ──
+  const isTriggered = ref(false)         // @ 弹窗是否激活
+  const triggerPosition = ref(0)         // @ 字符在文本中的位置
+  const searchQuery = ref('')            // 当前搜索词（@ 后面的文字）
+
+  // 检测逻辑：光标前一个字符是 @，且上下文不是邮箱（无字母数字在 @ 前）
+  function checkTrigger(cursorPos: number, text: string): boolean {
+    if (cursorPos === 0 || text[cursorPos - 1] !== '@') return false
+    if (cursorPos > 1 && /[\w.-]/.test(text[cursorPos - 2])) return false  // 排除邮箱
+    return true
+  }
+
+  // ── 搜索协调 ──
+  const materials = computed(() => /* 从 MaterialStore 查询 */)
+  async function searchMaterials(query: string): Promise<Material[]> {
+    // 优先本地 Store 过滤（< 100 条），否则走 IPC search（后端 FTS）
+  }
+
+  // ── 引用插入 ──
+  function insertRef(material: Material): string {
+    // 替换 @query 为 @{type|name}
+    return `@{${material.type}|${material.name}}`
+  }
+
+  // ── 引用解析 ──
+  function parseAllRefs(text: string): ParsedMessage { /* ... */ }
+
+  return { isTriggered, searchQuery, materials, searchMaterials, insertRef, parseAllRefs }
 }
 ```
 
-**MaterialAutocomplete 组件**：
+**MaterialAutocomplete 键盘交互规范**：
 
-```tsx
-// 触发：用户输入 @ 字符后
-// 显示：浮动下拉列表，显示素材名称 + 路径 + 类型图标
-// 搜索：实时模糊匹配素材名称
-// 选择：回车或点击选中，插入引用字符串
-// 关闭：Esc 或点击外部
+| 按键 | 行为 |
+|------|------|
+| ↑ / ↓ | 上下导航高亮项（循环） |
+| Enter | 选中当前高亮项，插入引用 |
+| Tab | 补全当前高亮项（不关闭，可继续输入） |
+| Esc | 关闭弹窗，保留 `@` 字符 |
+| 继续输入 | 实时过滤（300ms debounce） |
+| Backspace | 查询为空时关闭；删除 `@` 关闭 |
+| Click 外部 | 关闭弹窗，保留 `@` 字符 |
+
+**@ 与 / 触发器互斥状态机**：
+
+```
+                    ┌──────────┐
+          ─────────▶│  IDLE    │◀───────────
+         │          └────┬─────┘            │
+         │               │                  │
+     输入 @          输入 /              Esc/失焦
+         │               │                  │
+         ▼               ▼                  │
+  ┌──────────────┐  ┌──────────────┐        │
+  │  AT_ACTIVE   │  │ SLASH_ACTIVE │────────┘
+  │  (素材补全)   │  │ (skill 补全)  │
+  └──────────────┘  └──────────────┘
+         │               │
+     输入 /          输入 @       ← 互斥切换：一个激活时另一个自动关闭
+         ▼               ▼
+  ┌──────────────┐  ┌──────────────┐
+  │ SLASH_ACTIVE │  │  AT_ACTIVE   │
+  └──────────────┘  └──────────────┘
+```
+
+**AI 侧引用处理（materialRefPreprocessor）**：
+
+```typescript
+// core/queryEngine/materialRefPreprocessor.ts
+// ━━━ 在 QueryEngine.sendMessage() 调用 API 前执行 ━━━
+
+export async function preprocessMaterialRefs(
+  message: ParsedMessage,
+  materialStore: MaterialStore
+): Promise<{ enrichedText: string; systemPromptAddition: string }> {
+  if (message.refs.length === 0) return { enrichedText: message.text, systemPromptAddition: '' }
+
+  // 1. 查询每个引用的素材元数据
+  const metadata = await Promise.all(
+    message.refs.map(ref => materialStore.getMaterialMetadata(ref))
+  )
+
+  // 2. 展开引用为结构化描述，注入消息上下文
+  const enrichedText = message.text + '\n\n[素材引用详情]\n' +
+    metadata.map((m, i) =>
+      `[${i + 1}] ${message.refs[i].raw} → ` +
+      `文件: ${m.path}, 类型: ${m.type}, 时长: ${m.duration}s, ` +
+      `分辨率: ${m.width}x${m.height}, 格式: ${m.format}`
+    ).join('\n')
+
+  // 3. 系统提示词补充
+  const systemPromptAddition =
+    '用户消息中的 @{type|name} 是素材引用标记，详细元数据已在消息末尾列出。' +
+    '请根据素材信息调用对应 Tool 操作。'
+
+  return { enrichedText, systemPromptAddition }
+}
+```
+
+**MaterialRefValidator 验证规则**：
+
+```typescript
+// utils/materialRefValidator.ts
+interface RefValidationResult {
+  ref: MaterialRef
+  valid: boolean
+  error?: 'NOT_FOUND' | 'IN_TRASH' | 'UNSUPPORTED_FORMAT' | 'FILE_MISSING'
+  suggestion?: string  // "素材已在回收站，是否恢复？"
+}
+
+// 发送前验证（不阻断发送，仅行内提示）
+// NOT_FOUND → 红色下划线 + tooltip "素材不存在"
+// IN_TRASH  → 黄色下划线 + tooltip "素材在回收站"
+// FILE_MISSING → 红色下划线 + tooltip "文件已被移动或删除"
+// UNSUPPORTED_FORMAT → 红色下划线 + tooltip "不支持的素材格式"
 ```
 
 ---
 
-#### Phase 4.5：Windows 打包发布（5 tasks）
+#### Phase 4.5：Windows 打包发布（11 tasks）
+
+> **参考**：DMVideo `frontend/electron-builder.json`（完整 extraResources + asarUnpack + files 白名单）、
+> `frontend/scripts/build.js`（Vite → tsc → esbuild strip console → V8 bytecode 四阶段流水线）、
+> `frontend/.npmrc`（中国镜像源配置）
 
 | 编号 | 任务 | 交付物 | 依赖 | 验收标准 |
 |------|------|--------|------|----------|
-| P4.5.1 | electron-builder 配置 | `electron-builder.yml` | P2.9 | 配置文件正确，支持 Windows |
-| P4.5.2 | Windows x64 构建配置 | `package.json` | P4.5.1 | `bunx electron-builder --win` 成功 |
-| P4.5.3 | App 图标和名称 | `build/icon.ico` + `productName` | P4.5.1 | 打包后 .exe 显示正确图标和名称 |
-| P4.5.4 | 构建脚本 | `scripts/build.sh` / `.bat` | P4.5.2 | 一键构建，输出 `dist/` |
-| P4.5.5 | 用户 API Key 配置界面 | `components/Settings/APIKeyConfig.vue` | P2.7 | 用户可填入自己的 Key，App 保存到本地 |
+| P4.5.1 | electron-builder 完整配置 | `electron-builder.yml` | P2.9 | 含 appId/productName/asar/asarUnpack/extraResources/files/win/nsis/portable 完整配置；`bunx electron-builder --win` 无配置错误 |
+| P4.5.2 | 原生模块 rebuild 配置 | `package.json` + `.npmrc` | P4.5.1 | `better-sqlite3` / `@lancedb/lancedb` 通过 `@electron/rebuild` 编译成功；`.npmrc` 配置 npmmirror 镜像源 |
+| P4.5.3 | MCP Server Sidecar 打包 | `scripts/sidecar.ts` + electron-builder `extraResources` | P4.5.1 | MCP Server TypeScript 入口 + 依赖打包到 `resources/server/`；主进程 spawn 子进程启动成功 |
+| P4.5.4 | 环境文件与资源配置 | `.env.production` + `extraResources` 配置 | P4.5.1 | `.env.production` 打包到 `resources/`；生产模式读取正确；API Base URL 可配置 |
+| P4.5.5 | App 图标资源 | `build/icon.ico` (256px) + `build/icon.png` (512px) | - | ICO 含 16/32/48/256 四尺寸；任务栏和安装包显示正确图标和名称 |
+| P4.5.6 | 构建流水线脚本 | `scripts/build.ts` | P4.5.2~4 | 四阶段流水线：Vite(renderer) → tsc(main) → strip console → electron-builder；输出 NSIS + portable |
+| P4.5.7 | 代码保护 | `scripts/build.ts` (bytecode/obfuscator 阶段) | P4.5.6 | 主进程 JS 经 `esbuild drop:['console']` 处理；renderer 经 `vite-plugin-obfuscator` 混淆；asar 解包后不可直接阅读业务逻辑 |
+| P4.5.8 | 用户 API Key 配置界面 | `components/Settings/APIKeyConfig.vue` | P7.3, P7.4, P3.1.1 | 用户可填入 Key → `config:set-api-key` 加密存储；`config:get-api-key` 解密回显；支持多提供商切换 |
+| P4.5.9 | NSIS 安装包配置 | `electron-builder.yml` nsis 段 | P4.5.1 | 非一键安装；可选安装目录；桌面/开始菜单快捷方式；安装完成后自动启动 |
+| P4.5.10 | Portable 便携版输出 | `electron-builder.yml` win.target 段 | P4.5.1, P4.5.6 | 输出免安装 `.exe`（portable target）；双击即运行；用户数据存储在 `UserData/` 目录 |
+| P4.5.11 | 打包后冒烟测试 | `scripts/smoke-test.ts` | P4.5.6~10 | 自动验证：应用启动 → REPL 显示 → SQLite 初始化 → MCP Server 启动 → API Key 存取 → 生成草稿 E2E |
 
-**electron-builder.yml 配置**：
+**electron-builder.yml 完整配置**：
 
 ```yaml
 # electron-builder.yml
 appId: com.jydraft.app
 productName: JY Draft
-copyright: Copyright © 2024
+copyright: Copyright © ${new Date().getFullYear()} JY Draft
 directories:
   output: dist
   buildResources: build
 
+# ── ASAR 与原生模块 ──
+asar: true
+asarUnpack:
+  - "**/*.node"                    # better-sqlite3, LanceDB 原生二进制
+  - "node_modules/better-sqlite3/**/*"
+  - "node_modules/@lancedb/**/*"
+
+# ── 额外资源 ──
+extraResources:
+  - from: ".env.production"
+    to: ".env.production"
+  - from: "dist-server/"
+    to: "server/"                  # MCP Server Sidecar（TypeScript 编译产物）
+    filter: ["**/*"]
+
+# ── 打包文件白名单 ──
+files:
+  - from: "build/main"
+    to: "main"
+    filter: ["**/*"]
+  - from: "build/renderer"
+    to: "renderer"
+    filter: ["**/*"]
+  - from: "src/main/static"
+    to: "static"
+    filter: ["**/*"]
+  - "!dist"
+  - "!scripts"
+  - "!src"
+  - "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}"
+  - "!**/node_modules/*/{test,__tests__,tests,powered-test,example,examples}"
+  - "!**/node_modules/*.d.ts"
+  - "!**/node_modules/.bin"
+  - "!**/*.{iml,o,hprof,orig,pyc,pyo,rbc,swp,csproj,sln,xproj}"
+  - "!.editorconfig"
+  - "!**/._*"
+  - "!**/{.DS_Store,.git,.hg,.svn,CVS,RCS,SCCS,.gitignore,.gitattributes}"
+  - "!**/{__pycache__,thumbs.db,.flowconfig,.idea,.vs,.nyc_output}"
+  - "package.json"
+
+# ── Windows 目标 ──
 win:
   target:
     - target: nsis
       arch:
         - x64
+    - target: portable
+      arch:
+        - x64
   icon: build/icon.ico
 
+# ── NSIS 安装包 ──
 nsis:
   oneClick: false
+  perMachine: false
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
   createStartMenuShortcut: true
+  shortcutName: JY Draft
+  artifactName: "${productName}-Setup-${version}.${ext}"
+
+# ── Portable 便携版 ──
+portable:
+  artifactName: "${productName}-${version}-Portable.${ext}"
+```
+
+**构建流水线设计（四阶段）**：
+
+```
+Stage 1: Vite Build (Renderer)
+│  vite.build() → build/renderer/
+│
+Stage 2: TypeScript Compile (Main Process)
+│  tsc / esbuild → build/main/
+│
+Stage 3: Strip Console + Obfuscate
+│  esbuild.transform({ drop: ['console'] })  → 主进程移除日志
+│  vite-plugin-obfuscator                      → 渲染进程代码混淆
+│
+Stage 4: electron-builder Package
+│  electron-builder --win --x64
+│  ├── JY Draft-Setup-x.x.x.exe   (NSIS 安装包)
+│  └── JY Draft-x.x.x-Portable.exe (便携版)
+```
+
+```typescript
+// scripts/build.ts — 构建流水线主入口
+import { build as viteBuild } from 'vite'
+import { transform as esbuildTransform } from 'esbuild'
+
+async function buildPipeline() {
+  // Stage 1: Renderer
+  await viteBuild({ configFile: 'vite.config.ts', mode: 'production' })
+
+  // Stage 2: Main process TypeScript
+  await compileMainProcess()
+
+  // Stage 3: Strip console from main process JS
+  await stripConsoleFromMain()
+
+  // Stage 4: electron-builder
+  await packageElectron()
+}
 ```
 
 **用户 API Key 配置界面**：
@@ -5205,51 +5481,93 @@ nsis:
 ├─────────────────────────────────────────┤
 │                                         │
 │  模型提供商：  ○ bailian  ○ MiniMax      │
+│                     ○ GLM              │
 │                                         │
 │  API Key：   [________________________] │
+│              （加密存储到本地 SQLite）      │
 │                                         │
 │  API Base：  [________________________] │
 │              （可选，默认使用官方地址）      │
 │                                         │
 │  [保存配置]        [测试连接]             │
 │                                         │
+│  状态： ● 已连接 MiniMax                │
+│                                         │
 └─────────────────────────────────────────┘
 ```
 
-**构建流程**：
+**依赖关系图**：
+
+```
+P4.5.1 (electron-builder 配置)
+├── P4.5.2 (原生模块 rebuild)
+├── P4.5.3 (MCP Server Sidecar)
+├── P4.5.4 (环境文件配置)
+├── P4.5.5 (App 图标) ──── 无依赖，可并行
+├── P4.5.9 (NSIS 安装包)
+└── P4.5.10 (Portable 便携版)
+
+P4.5.2 + P4.5.3 + P4.5.4
+└── P4.5.6 (构建流水线脚本)
+    └── P4.5.7 (代码保护)
+        └── P4.5.11 (冒烟测试)
+
+P7.3 (API Key 加密存储) + P7.4 (API Key 解密读取) + P3.1.1 (权限类型)
+└── P4.5.8 (API Key 配置界面)
+```
+
+**打包后冒烟测试场景**：
+
+| 场景 | 验证内容 | 预期结果 |
+|------|----------|----------|
+| 应用启动 | 双击 .exe / 运行 portable | Electron 窗口打开，REPL 界面显示 |
+| SQLite 初始化 | 检查 `%APPDATA%/jy-draft/jy-draft.db` | 数据库文件存在，config 表有默认行 |
+| MCP Server 启动 | 查看日志 / 调用 `mcp:list-tools` | Sidecar 子进程运行，Tool 列表返回 |
+| API Key 存取 | 配置界面保存 → 重启 → 回显 | 加密存储正确，解密回显正确 |
+| 草稿 E2E | 输入"创建一个 1080p 草稿" | AI 调用 MCP create_draft → draft_content.json 生成 |
+| 原生模块 | 素材库页面加载 | better-sqlite3 查询正常，LanceDB 向量搜索可用 |
+
+**`.npmrc` 镜像配置**：
+
+```ini
+registry=https://registry.npmmirror.com/
+disturl=https://registry.npmmirror.com/-/binary/node
+electron_mirror=https://npmmirror.com/mirrors/electron/
+electron-builder-binaries_mirror=https://registry.npmmirror.com/-/binary/electron-builder-binaries/
+```
+
+**构建输出**：
 
 ```bash
-# 开发构建
-bun run build:electron
-
-# Windows 发布构建
-bunx electron-builder --win --x64
+# 一键构建
+bun run build:win
 
 # 输出
 dist/
-├── JY Draft Setup 1.0.0.exe  # NSIS 安装包
-└── JY Draft-1.0.0.exe        # 独立可执行文件
+├── JY Draft-Setup-1.0.0.exe          # NSIS 安装包
+├── JY Draft-1.0.0-Portable.exe       # 便携版（免安装）
+└── builder-effective-config.yaml      # electron-builder 实际生效配置
 ```
 
 ---
 
-#### Phase 4 任务总览（43 tasks）
+#### Phase 4 任务总览（55 tasks）
 
 | Phase | 任务数 | 核心交付 |
 |-------|--------|----------|
 | P4.1 核心 ReAct 循环测试 | 6 | E2E 测试通过，沙盒验证 |
 | P4.2 素材路径体系 | 11 | 跨平台路径核心 + 剪映映射 + 安全校验 + 存在性检查 + 目录发现 + 变更监听 |
 | P4.3 错误处理与提示 | 11 | 6 领域 ErrorCode + 标准响应格式 + 日志 + Error Boundary + Toast + 分级重试 + 校验错误 |
-| P4.4 @素材引用 | 2 | @触发自动完成 + 引用解析渲染 |
-| P4.5 Windows 打包发布 | 5 | .exe 安装包 + Key 配置界面 |
-| **合计** | **43** | 可发布 Windows 版本 |
+| P4.4 @素材引用 | 8 | 触发 Composable + 自动完成 + 引用格式解析 + 消息渲染 + AI 管道 + 验证 + 互斥管理 + 测试 |
+| P4.5 Windows 打包发布 | 11 | electron-builder + 原生模块 + Sidecar + 环境配置 + 图标 + 构建流水线 + 代码保护 + Key 配置 + NSIS + Portable + 冒烟测试 |
+| **合计** | **55** | 可发布 Windows 版本（NSIS 安装包 + Portable 便携版） |
 
 ---
 
 #### Phase 4 开发顺序（2 轮迭代）
 
 ```
-第1轮迭代（测试 + 路径基础 + 错误基础）
+第1轮迭代（测试 + 路径基础 + 错误基础 + 引用基础 + 打包基础）
 ├── P4.1.1 沙盒测试环境
 ├── P4.1.2 QueryEngine 单测
 ├── P4.1.3 ToolExecutor 单测
@@ -5265,9 +5583,16 @@ dist/
 ├── P4.3.3 MCP 错误转换
 ├── P4.3.5 错误日志基础设施
 ├── P4.3.6 Vue Error Boundary
-└── P4.4.1 @素材自动完成
+├── P4.4.1 @触发检测 Composable
+├── P4.4.2 @素材自动完成组件
+├── P4.4.3 引用格式定义与解析器
+├── P4.5.1 electron-builder 完整配置
+├── P4.5.2 原生模块 rebuild 配置
+├── P4.5.3 MCP Server Sidecar 打包
+├── P4.5.4 环境文件与资源配置
+└── P4.5.5 App 图标资源
 
-第2轮迭代（路径集成 + 错误体验 + 打包 + 引用）
+第2轮迭代（路径集成 + 错误体验 + 引用集成 + 打包发布）
 ├── P4.1.4 IPC 通道测试
 ├── P4.1.5 权限流程测试
 ├── P4.1.6 E2E ReAct 循环
@@ -5281,12 +5606,17 @@ dist/
 ├── P4.3.9 用户侧错误恢复体验
 ├── P4.3.10 校验错误格式与展示
 ├── P4.3.11 错误处理集成测试
-├── P4.4.2 素材引用解析渲染
-├── P4.5.1 electron-builder 配置
-├── P4.5.2 Windows x64 构建
-├── P4.5.3 App 图标和名称
-├── P4.5.4 构建脚本
-└── P4.5.5 API Key 配置界面
+├── P4.4.4 引用渲染组件（消息流）
+├── P4.4.5 AI 侧引用处理管道
+├── P4.4.6 素材引用验证
+├── P4.4.7 @ 与 / 触发器互斥管理
+├── P4.4.8 集成测试
+├── P4.5.6 构建流水线脚本
+├── P4.5.7 代码保护
+├── P4.5.8 用户 API Key 配置界面
+├── P4.5.9 NSIS 安装包配置
+├── P4.5.10 Portable 便携版输出
+└── P4.5.11 打包后冒烟测试
 ```
 
 ---
@@ -5310,62 +5640,201 @@ dist/
 
 ---
 
-#### Phase 5.1：滤镜/特效 MCP 增强（6 tasks）
+#### Phase 5.1：滤镜/特效 MCP 增强（8 tasks）
 
-> 在 Phase 1 的 MCP handler 基础上升级，增加 AI 语义匹配能力
+> 在 Phase 1 步骤 6/7 的 MCP handler 基础上升级，增加人物特效支持、具名参数映射、VIP 过滤、AI 语义搜索能力
+
+**DMVideo 元数据源**（`pjy/metadata/`）：
+
+| 文件 | 类型 | 预设数 | 参数特征 |
+|------|------|--------|----------|
+| `filter_meta.py` → `FilterType` 枚举 | 滤镜 | 972 | 多数无参数（空 params）；部分有 `effects_adjust_filter`（0.0-1.0） |
+| `video_scene_effect.py` → `VideoSceneEffectType` 枚举 | 画面特效 | 1097 | 2-8 个具名参数（speed/filter/blur/sharpen/luminance/...） |
+| `video_character_effect.py` → `VideoCharacterEffectType` 枚举 | 人物特效 | 240 | 2-4 个具名参数（size/vertical_shift/speed/color） |
+| `audio_scene_effect.py` + `tone_effect.py` | 音频特效 | Phase 5.3 处理 | — |
 
 | 编号 | 任务 | 交付物 | 依赖 | 验收标准 |
 |------|------|--------|------|----------|
-| P5.1.1 | 升级 generate_video_filter handler | `core/mcp/handlers/effect.py` | P1.3 | 支持 intensity 参数，支持 segment_ids + segment_index |
-| P5.1.2 | 升级 generate_video_effect handler | `core/mcp/handlers/effect.py` | P1.3 | 支持 params 数组，支持多特效叠加 |
-| P5.1.3 | list_filter_presets AI 增强 | `core/mcp/handlers/effect.py` | P5.1.1 | 支持语义搜索：「复古」「电影感」「暖色」→ 匹配多个预设 |
-| P5.1.4 | list_video_effect_presets AI 增强 | `core/mcp/handlers/effect.py` | P5.1.2 | 支持语义搜索：「故障」「抖动」「模糊」→ 匹配多个预设 |
-| P5.1.5 | 滤镜/特效推荐 AI Prompt | `core/ai/effect_recommend.py` | P5.1.3,4 | 用户描述意图 → AI 返回 2-3 个推荐 + 理由 |
-| P5.1.6 | 滤镜/特效 MCP 单元测试 | `__tests__/mcp/effect.test.ts` | P5.1.1,2 | 生成/查询/AI 匹配全通过 |
+| P5.1.1 | 升级 generate_video_filter handler | `core/mcp/handlers/effect.py` | Phase 1 步骤7 | 有参数/无参数滤镜自动判断；intensity 0-100 → 实际范围映射；segment_ids + segment_index |
+| P5.1.2 | 升级 generate_video_scene_effect handler | `core/mcp/handlers/effect.py` | Phase 1 步骤7 | 具名参数 `{name: value}` 映射（非 index 数组）；多特效叠加 + render_index 递增（10000 起） |
+| P5.1.3 | 新增 generate_video_character_effect handler | `core/mcp/handlers/effect.py` | Phase 1 步骤7 | 支持人物特效 240 预设（`VideoCharacterEffectType`）；size/vertical_shift/speed/color 参数；独立轨道 |
+| P5.1.4 | list_filter_presets AI 增强 | `core/mcp/handlers/preset.py` | Phase 1 步骤6 | 名称模糊搜索 972 预设；返回 is_vip + params 定义；支持 `include_vip` 过滤 |
+| P5.1.5 | list_video_effect_presets AI 增强 | `core/mcp/handlers/preset.py` | Phase 1 步骤6 | 分离画面/人物特效查询（`effect_category: "scene"\|"character"`）；语义搜索 1337 预设；is_vip 标记 |
+| P5.1.6 | VIP 过滤 + 错误处理中间件 | `core/mcp/handlers/effect.py` | P5.1.1,2,3 | is_vip 检查（非会员请求 VIP → 返回提示 + 免费替代推荐）；`from_name()` 未命中 → 模糊匹配返回近似项；参数越界自动 clamp 0-100 |
+| P5.1.7 | 滤镜/特效 AI 推荐引擎 | `core/ai/effect_recommend.py` | P5.1.4,5 | 用户意图 → GLM 模型推荐 2-3 个（含理由）；按类别分批控制上下文窗口（单批 ≤50 条） |
+| P5.1.8 | 滤镜/特效 MCP 单元测试 | `__tests__/mcp/effect.test.ts` | P5.1.1~7 | 滤镜/画面特效/人物特师生成 + AI 搜索 + VIP 过滤 + 错误回退全通过 |
 
-**AI 语义匹配设计**：
+**依赖关系图**：
 
-```typescript
-// 语义搜索映射（滤镜示例）
-const filterSemanticMap = {
-  "复古": ["复古", "胶片", "回忆", "老照片", "暖色"],
-  "电影感": ["电影", "冷色", "对比度", "饱和度", "情绪"],
-  "清新": ["奶油", "蓝调", "通透", "明亮"],
-  "黑白": ["黑白", "灰度", "复古黑白"],
-}
+```
+Phase 1 步骤6,7（基线 handler）
+    ├── P5.1.1 ─── generate_video_filter 升级
+    ├── P5.1.2 ─── generate_video_scene_effect 升级
+    ├── P5.1.3 ─── generate_video_character_effect 新增
+    │
+    ├── P5.1.4 ─── list_filter_presets AI 增强
+    ├── P5.1.5 ─── list_video_effect_presets AI 增强
+    │        │
+    │        ├── P5.1.6 ─── VIP 过滤 + 错误处理（依赖 P5.1.1,2,3）
+    │        └── P5.1.7 ─── AI 推荐引擎（依赖 P5.1.4,5）
+    │                     │
+    └─────────────────────┴── P5.1.8 ─── 单元测试（依赖 P5.1.1~7）
+```
 
-// AI 推荐 Prompt（简化）
-const filterRecommendPrompt = `
-用户想要：{userIntent}
-可选滤镜：{presetList}
-请推荐 2-3 个最合适的，给出理由。
-格式：1. 滤镜名 - 理由
-`
+**参数映射机制**（基于 `effect_meta.py:parse_params`）：
+
+```python
+# DMVideo 已有的 0-100 → 实际范围映射
+# val = min_value + (max_value - min_value) * input_v / 100.0
+
+# 滤镜示例：有参数的滤镜（如「书意」）
+generate_video_filter("书意", intensity=80)
+# → effects_adjust_filter = 0.0 + (1.0 - 0.0) * 80/100 = 0.8
+
+# 滤镜示例：无参数的滤镜（大多数滤镜）
+generate_video_filter("复古")  # params 为空，忽略 intensity
+# → 直接使用 EffectMeta 默认值
+
+# 画面特效：具名参数映射（不再用 index 数组）
+generate_video_scene_effect("CCD闪光", params={
+    "effects_adjust_filter": 80,      # 0-100 → 0.0-1.0
+    "effects_adjust_sharpen": 60,     # 0-100 → 0.0-1.0
+    "effects_adjust_speed": 50,       # 0-100 → 0.0-1.0
+})
+# 未指定的参数使用 EffectMeta.default_value
+
+# 人物特效
+generate_video_character_effect("BOOM!", params={
+    "effects_adjust_size": 70,
+    "effects_adjust_speed": 80,
+})
 ```
 
 **MCP Tool 签名（升级后）**：
 
 ```typescript
-// 生成滤镜
+// ========== 滤镜生成 ==========
 generate_video_filter(
-  filter_type_name: string,      // 可为中文名或英文名
-  intensity?: number,              // 0-100，默认 100
-  segment_ids?: string[],         // 素材片段 ID
-  segment_index?: number[],       // 素材位置（从 1 开始）
-)
+  filter_type_name: string,          // 中文名或英文名，如 "复古"、"书意"
+  intensity?: number,                 // 0-100，仅对有参数的滤镜生效，默认 100
+  segment_ids?: string[],            // 素材片段 ID
+  segment_index?: number[],          // 素材位置（从 1 开始）
+): { filter_ids: string[] }
 
-// AI 推荐滤镜（新增 Tool）
-recommend_filters(
-  intent: string,                 // 用户意图描述，如「复古电影感」
-  context?: string                // 上下文，可选
-): { recommendations: FilterRecommendation[] }
+// ========== 画面特效生成 ==========
+generate_video_scene_effect(
+  effect_type_name: string,          // 画面特效名，如 "CCD闪光"、"_1998"
+  params?: Record<string, number>,   // 具名参数 key-value，值 0-100
+  segment_ids?: string[],
+  segment_index?: number[],
+  stack_index?: number,              // 叠加序号（0=首个，render_index=10000+stack_index）
+): { effect_ids: string[] }
 
-interface FilterRecommendation {
-  name: string;                  // 滤镜名称
-  reason: string;                 // 推荐理由
-  confidence: number;             // 置信度 0-1
-  preview_url?: string;           // 预览图 URL（如果有）
+// ========== 人物特效生成（新增）==========
+generate_video_character_effect(
+  effect_type_name: string,          // 人物特效名，如 "BOOM!"、"中刀"、"九尾狐"
+  params?: Record<string, number>,   // 具名参数：size/vertical_shift/speed/color
+  segment_ids?: string[],
+  segment_index?: number[],
+): { effect_ids: string[] }
+
+// ========== 预设查询（AI 增强）==========
+list_filter_presets(
+  query?: string,                     // 语义搜索关键词，如 "复古"、"电影感"
+  include_vip?: boolean,              // 是否包含 VIP 预设，默认 true
+): { filters: FilterPreset[] }
+
+list_video_effect_presets(
+  effect_category: "scene" | "character" | "all",  // 区分画面/人物特效
+  query?: string,                     // 语义搜索关键词
+  include_vip?: boolean,
+): { effects: EffectPreset[] }
+
+// ========== AI 推荐（新增）==========
+recommend_effects(
+  intent: string,                     // 用户意图描述，如「复古电影感」「给人物加动感」
+  target_type?: "filter" | "scene_effect" | "character_effect",
+  context?: string,                   // 上下文（当前素材类型、已有特效等）
+): { recommendations: EffectRecommendation[] }
+
+// ========== 类型定义 ==========
+interface FilterPreset {
+  name: string;                       // 滤镜名称
+  has_params: boolean;                // 是否有可调参数
+  params: ParamDefinition[];          // 参数定义（可能为空）
+  is_vip: boolean;                    // 是否 VIP 专属
 }
+
+interface EffectPreset {
+  name: string;
+  category: "scene" | "character";    // 画面特效 or 人物特效
+  params: ParamDefinition[];
+  is_vip: boolean;
+}
+
+interface ParamDefinition {
+  name: string;                       // 参数名，如 "effects_adjust_filter"
+  default_value: number;              // 默认值（实际范围，如 1.0）
+  min_value: number;                  // 最小值（实际范围，如 0.0）
+  max_value: number;                  // 最大值（实际范围，如 1.0）
+}
+
+interface EffectRecommendation {
+  name: string;                       // 滤镜/特效名称
+  type: "filter" | "scene_effect" | "character_effect";
+  reason: string;                     // 推荐理由
+  is_vip: boolean;                    // 提示用户是否需要会员
+}
+```
+
+**AI 推荐引擎设计**：
+
+```python
+# core/ai/effect_recommend.py
+# 调用 GLM 模型进行推荐，按类别分批控制上下文窗口
+
+RECOMMEND_PROMPT = """
+你是一个视频特效推荐专家。用户想要：{intent}
+当前素材上下文：{context}
+
+可选的{effect_type}列表（名称 | 参数 | 是否VIP）：
+{preset_batch}
+
+请推荐 2-3 个最合适的，格式：
+1. 名称 - 推荐理由（一句话）
+"""
+
+class EffectRecommender:
+    def __init__(self, model_client):
+        self.model = model_client  # GLM API client
+
+    async def recommend(self, intent: str, target_type: str, context: str = "") -> list:
+        # 1. 确定搜索范围
+        if target_type == "filter":
+            presets = self._get_filter_presets()
+        elif target_type == "scene_effect":
+            presets = self._get_scene_presets()
+        elif target_type == "character_effect":
+            presets = self._get_character_presets()
+        else:
+            presets = self._get_all_presets()
+
+        # 2. 按名称关键词粗筛（缩小到 ≤50 条）
+        candidates = self._fuzzy_filter(presets, intent, max_results=50)
+
+        # 3. 构建分批 prompt（单批 ≤50 条，控制 token 消耗）
+        prompt = RECOMMEND_PROMPT.format(
+            intent=intent,
+            context=context or "无",
+            effect_type=target_type or "全部",
+            preset_batch=self._format_batch(candidates),
+        )
+
+        # 4. 调用 GLM 模型
+        response = await self.model.chat(prompt)
+
+        # 5. 解析推荐结果，校验名称存在性
+        return self._parse_and_validate(response, candidates)
 ```
 
 ---
@@ -5497,13 +5966,13 @@ def recommend_transition(segment_a, segment_b):
 ├─────────────────────────────────────────────────────────────┤
 │ 根据「复古电影感」为你推荐以下滤镜：                            │
 │                                                             │
-│   1. 复古 (confidence: 92%)                                  │
+│   1. 复古                                                    │
 │      └─ 理由：暖色调 + 高对比度，适合怀旧场景                  │
 │                                                             │
-│   2. 胶片 (confidence: 78%)                                 │
+│   2. 胶片                                                    │
 │      └─ 理由：颗粒感 + 偏黄，模拟老电影效果                   │
 │                                                             │
-│   3. 情绪 (confidence: 65%)                                  │
+│   3. 情绪                                                    │
 │      └─ 理由：低饱和度 + 暗角，营造电影氛围                   │
 │                                                             │
 │ 请输入数字选择（1-3），或输入自定义描述：                       │
@@ -5516,7 +5985,7 @@ def recommend_transition(segment_a, segment_b):
 用户：「给视频加一个复古滤镜」
          │
          ▼
-AI 理解意图 → 调用 recommend_filters("复古") → 获取推荐列表
+AI 理解意图 → 调用 recommend_effects("复古", target_type="filter") → 获取推荐列表
          │
          ▼
 显示确认界面 → 用户输入「1」选择「复古」
@@ -5551,36 +6020,38 @@ AI 调用 generate_video_filter("复古", intensity=80)
 
 ---
 
-#### Phase 5 任务总览（19 tasks）
+#### Phase 5 任务总览（21 tasks）
 
 | Phase | 任务数 | 核心交付 |
 |-------|--------|----------|
-| P5.1 滤镜/特效 MCP 增强 | 6 | 100+ 预设可 AI 语义搜索 |
+| P5.1 滤镜/特效 MCP 增强 | 8 | 滤镜 972 + 画面特效 1097 + 人物特效 240，具名参数 + VIP 过滤 + AI 推荐 |
 | P5.2 关键帧 MCP | 4 | 9 种属性动画 + AI 描述 |
 | P5.3 音频特效 MCP | 3 | 4 种变声特效 + AI 推荐 |
 | P5.4 转场 MCP | 3 | 转场生成 + AI 内容分析推荐 |
 | P5.5 统一确认流程 | 3 | 先描述再执行 + 推荐展示 |
 | P5.6 E2E + 最小化 UI | 3 | 全流程 E2E + 特效轨道 |
-| **合计** | **19** | 特效/滤镜/关键帧完整功能 |
+| **合计** | **21** | 特效/滤镜/关键帧完整功能 |
 
 ---
 
 #### Phase 5 开发顺序（3 轮迭代）
 
 ```
-第1轮迭代（MCP 核心）
-├── P5.1.1 generate_video_filter handler 升级
-├── P5.1.2 generate_video_effect handler 升级
-├── P5.1.3 list_filter_presets AI 增强
-├── P5.1.4 list_video_effect_presets AI 增强
+第1轮迭代（MCP 核心：handler 升级 + 预设查询增强）
+├── P5.1.1 generate_video_filter handler 升级（intensity + 有/无参数判断）
+├── P5.1.2 generate_video_scene_effect handler 升级（具名参数 + render_index）
+├── P5.1.3 generate_video_character_effect handler 新增（人物特效 240 预设）
+├── P5.1.4 list_filter_presets AI 增强（972 预设模糊搜索 + VIP）
+├── P5.1.5 list_video_effect_presets AI 增强（画面/人物分离 + 1337 预设）
 ├── P5.2.1 generate_keyframe handler 升级
 ├── P5.2.2 generate_audio_keyframe handler 升级
 ├── P5.3.1 generate_audio_effect handler 升级
 └── P5.4.1 generate_transition handler 升级
 
-第2轮迭代（AI 推荐 + 确认）
-├── P5.1.5 滤镜/特效推荐 AI Prompt
-├── P5.1.6 滤镜/特效 MCP 单元测试
+第2轮迭代（中间件 + AI 推荐 + 确认）
+├── P5.1.6 VIP 过滤 + 错误处理中间件
+├── P5.1.7 滤镜/特效 AI 推荐引擎（GLM 模型集成）
+├── P5.1.8 滤镜/特效 MCP 单元测试
 ├── P5.2.3 关键帧属性 AI 描述
 ├── P5.2.4 关键帧 MCP 单元测试
 ├── P5.3.2 音频变声 AI 推荐
