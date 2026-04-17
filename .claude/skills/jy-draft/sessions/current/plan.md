@@ -28,7 +28,7 @@
 3. **分割存储方案**：
    - 切割成独立文件
    - 存放路径：`原视频目录/smaterSplit/<yyyy-mm-dd>/`
-   - 命名规则：`源文件名_<xxxx序号>.后缀`（序号4位，不足补0）
+   - 命名规则：`源文件名_<xxxx序号>.后缀`（序号5位，不足补0）
 4. **向量数据库用途**：
    - 视频文本 → 素材检索
    - 自然语言 → 语义搜索素材
@@ -44,7 +44,7 @@
 - 向量数据库：用于语义匹配素材
 
 ### 需求描述流程（双模式）
-1. **AI引导模式**：用户上传视频素材 → 点击视频分析 → AI主动询问细节 → 生成合适的提示词 → 交由多模态大模型分析 → 得到视频描述
+1. **AI引导模式**：用户上传视频素材 → 点击视频分析 → AI主动询问细节 → 生成合适的提示词 → 交由多模态大模型分析（bailian，已在E:\code\claude-code\.claude\skills\jy-draft\references\DMVideo\frontend\src\main\core\bailian.ts进行了封装） → 得到视频描述
 2. **手动填写模式**：用户直接手动填写视频描述
 
 ### 素材缺失处理策略（用户自选）
@@ -54,7 +54,7 @@
 
 ### 草稿输出
 - 直接输出到剪映工程目录（用户手动指定路径）
-- 生成后跳转剪映打开，App内不做编辑
+- 生成后引导用户使用剪映打开，App内不做编辑
 
 ### 版本历史
 - 手动保存版本（按钮 + 快捷键）
@@ -75,9 +75,9 @@
 - 后端改造：DMVideo backend → MCP Server
 
 ### GUI 界面功能
-- 草稿列表 + 素材管理
+- 草稿列表 + 素材管理（素材管理采用基于文件夹结构的目录树）
 - AI 对话（增强 REPL）
-- 生成后跳转到剪映打开（App内不做编辑）
+- 生成后引导用户使用剪映打开（App内不做编辑）
 - 不需要草稿预览功能
 
 ### 草稿 JSON 结构
@@ -114,8 +114,8 @@
 - 不自动无限重试
 
 ### 技术风险评估
-- **最大风险**：MCP协议对接（MCP Server和Electron的集成复杂度）
-- 剪映工程目录格式可能有版本差异
+- **最大风险**：MCP协议对接（MCP Server和Electron的集成复杂度）、AI Agent底层的核心需求实现（需借鉴Claude Code的实现思想）
+- 剪映工程目录格式可能有版本差异，主要兼容剪映5.6版本
 - AI视频理解结果的准确性
 - 向量检索可能匹配到不相关素材
 
@@ -291,7 +291,7 @@ Electron Main Process 中的核心编排器，管理会话生命周期。
 | 会话管理 | submitMessage() 作为 AsyncGenerator，驱动完整对话周期 | QueryEngine.submitMessage() |
 | 持久化 | 会话转写存储到 SQLite + JSONL，支持会话恢复 | JSONL transcript 持久化 |
 | 费用追踪 | 按模型统计 token 消耗和 API 成本 | cost tracking per model |
-| 版本快照 | 草稿 JSON 修改前后快照，支持 diff 和回滚 | file history snapshots |
+| 版本快照 | 草稿 JSON 修改前后快照，支持回滚 | file history snapshots |
 | 模型热切换 | 对话中途可切换 bailian/GLM/MiniMax | model hot-swap |
 
 **会话持久化结构**：
@@ -5651,7 +5651,9 @@ dist/
 | `filter_meta.py` → `FilterType` 枚举 | 滤镜 | 972 | 多数无参数（空 params）；部分有 `effects_adjust_filter`（0.0-1.0） |
 | `video_scene_effect.py` → `VideoSceneEffectType` 枚举 | 画面特效 | 1097 | 2-8 个具名参数（speed/filter/blur/sharpen/luminance/...） |
 | `video_character_effect.py` → `VideoCharacterEffectType` 枚举 | 人物特效 | 240 | 2-4 个具名参数（size/vertical_shift/speed/color） |
-| `audio_scene_effect.py` + `tone_effect.py` | 音频特效 | Phase 5.3 处理 | — |
+| `audio_scene_effect.py` → `AudioSceneEffectType` 枚举 | 场景音 | 85 | 12 免费 + 73 VIP；0~3 参数（强弱/quantity/pitch_shift/timbre/strength/深度/频率/幅度/空间大小/噪点） |
+| `tone_effect.py` → `ToneEffectType` 枚举 | 音色（变声） | 57 | 14 免费 + 43 VIP；0~2 参数（音调/音色/强弱），部分无参数 |
+| `speech_to_song.py` → `SpeechToSongType` 枚举 | 声音成曲 | 6 | 2 免费 + 4 VIP；全部无参数；⚠️ "目前不能自动被剪映所识别" |
 
 | 编号 | 任务 | 交付物 | 依赖 | 验收标准 |
 |------|------|--------|------|----------|
@@ -5839,126 +5841,497 @@ class EffectRecommender:
 
 ---
 
-#### Phase 5.2：关键帧 MCP（4 tasks）
+#### Phase 5.2：关键帧 MCP（5 tasks）
+
+> **审计修订 2026-04-17**：基于 DMVideo 源码交叉验证，修正属性计数（9→11）、位置单位（像素→半画布）、AI 示例结构、互斥约束、任务动词（升级→实现）、新增管理工具 task。
 
 | 编号 | 任务 | 交付物 | 依赖 | 验收标准 |
 |------|------|--------|------|----------|
-| P5.2.1 | 升级 generate_keyframe handler | `core/mcp/handlers/keyframe.py` | P1.3 | 支持全部 9 种属性（位置/缩放/旋转/透明度/饱和度/对比度/亮度/音量） |
-| P5.2.2 | 升级 generate_audio_keyframe handler | `core/mcp/handlers/keyframe.py` | P1.3 | 支持音量渐变（渐入/渐出） |
-| P5.2.3 | 关键帧属性 AI 描述 | `core/ai/keyframe_describe.py` | P5.2.1 | 「渐入效果」→ `{property: "alpha", time_offset: [0], value: [0→1]}` |
-| P5.2.4 | 关键帧 MCP 单元测试 | `__tests__/mcp/keyframe.test.ts` | P5.2.1,2 | 生成/查询/AI 描述全通过 |
+| P5.2.1 | **实现** generate_keyframe handler | `core/mcp/handlers/keyframe.py` | P1.8 | 支持全部 **11** 种属性（详见属性表），适用于 Video/Text/Sticker 片段 |
+| P5.2.2 | **实现** generate_audio_keyframe handler | `core/mcp/handlers/keyframe.py` | P1.8 | 支持音量渐变（渐入/渐出），仅限 AudioSegment |
+| P5.2.3 | 关键帧管理 MCP 工具 | `core/mcp/handlers/keyframe.py` | P5.2.1 | `get_keyframe_ids` / `clear_keyframes` / `list_keyframe_properties` |
+| P5.2.4 | 关键帧属性 AI 描述 | `core/ai/keyframe_describe.py` | P5.2.1 | 「渐入效果」→ `{property: "alpha", time_offset: [0, 5000000], value: [0, 1]}` |
+| P5.2.5 | 关键帧 MCP 单元测试 | `__tests__/mcp/keyframe.test.ts` | P5.2.1,2,3 | 生成/查询/管理/AI 描述全通过 |
 
-**KeyframeProperty 支持的属性**：
+**关键帧架构说明**（来自 DMVideo 源码）：
 
-| 属性 | 中文名 | 值范围 | 常见用法 |
-|------|--------|--------|----------|
-| `position_x` | X轴位置 | 像素值 | 左移/右移 |
-| `position_y` | Y轴位置 | 像素值 | 上移/下移 |
-| `rotation` | 旋转 | 度数 | 顺时针旋转 |
-| `scale_x` | X轴缩放 | 0.0-10.0 | 横向拉伸 |
-| `scale_y` | Y轴缩放 | 0.0-10.0 | 纵向拉伸 |
-| `uniform_scale` | 等比缩放 | 0.0-10.0 | 放大/缩小 |
-| `alpha` | 透明度 | 0.0-1.0 | 淡入/淡出 |
-| `saturation` | 饱和度 | -1.0-1.0 | 增强/减弱色彩 |
-| `contrast` | 对比度 | -1.0-1.0 | 增强/减弱对比 |
-| `brightness` | 亮度 | -1.0-1.0 | 增亮/变暗 |
-| `volume` | 音量 | 0.0-10.0 | 渐强/渐弱 |
+```
+KeyframeList（属性级）
+├── list_id: str（自动生成）
+├── keyframe_property: KeyframeProperty（控制的属性类型）
+└── keyframes: Keyframe[]（关键帧列表，按 time_offset 排序）
+    └── Keyframe
+        ├── kf_id: str（自动生成）
+        ├── time_offset: int（微秒，相对素材起始）
+        └── values: [float]（通常单元素）
+
+存储位置：segment.common_keyframes: List[KeyframeList]
+```
+
+**KeyframeProperty 支持的属性（11 种）**：
+
+| 属性 | 中文名 | 值范围 | 单位/说明 | 适用片段 | 互斥约束 |
+|------|--------|--------|-----------|----------|----------|
+| `position_x` | X轴位置 | -∞ ~ +∞ | **半画布宽**（值 = 像素 ÷ 画布宽/2） | Video, Text, Sticker | — |
+| `position_y` | Y轴位置 | -∞ ~ +∞ | **半画布高**（值 = 像素 ÷ 画布高/2） | Video, Text, Sticker | — |
+| `rotation` | 旋转 | -∞ ~ +∞ | 顺时针角度 | Video, Text, Sticker | — |
+| `scale_x` | X轴缩放 | 0.0+ | 1.0=原始 | Video, Text, Sticker | ⚠️ 与 `uniform_scale` 互斥 |
+| `scale_y` | Y轴缩放 | 0.0+ | 1.0=原始 | Video, Text, Sticker | ⚠️ 与 `uniform_scale` 互斥 |
+| `uniform_scale` | 等比缩放 | 0.0+ | 1.0=原始，内部映射为 `scale_x` | Video, Text, Sticker | ⚠️ 与 `scale_x`/`scale_y` 互斥 |
+| `alpha` | 透明度 | 0.0-1.0 | 1.0=完全不透明 | Video, Text, Sticker | — |
+| `saturation` | 饱和度 | -1.0-1.0 | 0.0=原始 | **Video only** | — |
+| `contrast` | 对比度 | -1.0-1.0 | 0.0=原始 | **Video only** | — |
+| `brightness` | 亮度 | -1.0-1.0 | 0.0=原始 | **Video only** | — |
+| `volume` | 音量 | 0.0+ | 1.0=原始音量 | Video, Text, Audio | — |
+
+> **⚠️ 互斥规则**（源码 `VisualSegment.add_keyframe()`）：
+> - 设 `scale_x` 或 `scale_y` → 自动关闭 `uniform_scale`（`uniform_scale.on = false`）
+> - 设 `uniform_scale` 时若已有 `scale_x/y` → **抛出 ValueError**
+> - `uniform_scale` 内部映射为 `KeyframeProperty.scale_x`，export JSON 中 `property_type = "KFTypeScaleX"` + `uniform_scale.on = true`
+
+> **⚠️ 位置单位换算**：
+> - 画布 1920×1080：position_x 范围 [-1.0, 1.0] 覆盖可见区域
+> - 向左移一屏 = position_x = -1.0（**不是** -1920）
+> - 向右移半屏 = position_x = 0.5
 
 **AI 关键帧描述示例**：
 
 ```
 用户：「给这段视频加一个淡入效果」
-AI 理解：alpha 从 0 渐变到 1
+AI 理解：alpha 从 0 渐变到 1，持续 1 秒
 输出：{
   property: "alpha",
-  time_offset: [0],
-  value: [0, 1],
+  time_offset: [0, 1000000],   // 0秒和1秒（微秒）
+  value: [0, 1],               // 0→1，数组长度必须与 time_offset 一致
   segment_index: [1]
 }
 
 用户：「让字幕从左边飞进来」
-AI 理解：position_x 从 -1920 渐变到 0（假设 1920x1080）
+AI 理解：position_x 从 -1.0 渐变到 0（半画布单位，-1.0 = 向左一屏）
 输出：{
   property: "position_x",
-  time_offset: [0, 1000000],  // 0-1秒
-  value: [-1920, 0],
+  time_offset: [0, 1000000],   // 0-1秒
+  value: [-1.0, 0],            // 半画宽数据：-1.0=向左一屏，0=居中
+  segment_index: [1]
+}
+
+用户：「让视频等比放大 1.5 倍」
+AI 理解：uniform_scale 从 1.0 变到 1.5
+输出：{
+  property: "uniform_scale",
+  time_offset: [0, 2000000],   // 0-2秒
+  value: [1.0, 1.5],
+  segment_index: [1]
+}
+// 注意：内部映射为 scale_x，export JSON 中 property_type = "KFTypeScaleX"
+
+用户：「音量渐强」
+AI 理解：volume 从 0 渐变到 1.0（原始音量）
+输出：{
+  property: "volume",           // 音频关键帧走 generate_audio_keyframe
+  time_offset: [0, 3000000],   // 0-3秒
+  volume: [0, 1.0],            // 0→原始音量
   segment_index: [1]
 }
 ```
 
+**generate_keyframe handler 实现要点**：
+
+1. **片段类型识别**：通过 `segment_ids` 查找片段，判断类型调用对应方法
+   - VideoSegment / TextSegment / StickerSegment → `VisualSegment.add_keyframe(property, time_offset, value)`
+   - AudioSegment → 应走 `generate_audio_keyframe`，若收到非法属性需报错
+2. **互斥检查**：设 `scale_x`/`scale_y` 前检查 `uniform_scale` 状态，设 `uniform_scale` 前检查是否已有 `scale_x/y`
+3. **属性适用性检查**：`saturation`/`contrast`/`brightness` 仅对 VideoSegment 有效，对 Text/Sticker 需报错或忽略
+4. **数组长度校验**：`time_offset` 和 `value` 长度必须相等，每个元素对应一个关键帧点
+5. **时间偏移校验**：`time_offset` 值应在片段时长范围内
+
+**generate_audio_keyframe handler 实现要点**：
+
+1. **仅支持 volume**：`AudioSegment.add_keyframe(time_offset, volume)` 硬编码为 `KeyframeProperty.volume`
+2. **参数映射**：MCP 参数 `volume[]` → `AudioSegment.add_keyframe(time_offset[i], volume[i])`
+3. **渐入渐出场景**：渐入 `volume: [0, 1.0]`，渐出 `volume: [1.0, 0]`
+
+**管理工具说明**：
+
+| 工具 | 功能 | 返回 |
+|------|------|------|
+| `list_keyframe_properties()` | 列出所有可用属性及值范围 | `{properties: [{name, range, unit, applicable_to}]}` |
+| `get_keyframe_ids(draft_id)` | 获取已生成的关键帧 ID 列表 | `{keyframe_ids: string[]}` |
+| `clear_keyframes(draft_id)` | 清除指定草稿的关键帧缓存 | `{code: 0}` |
+
 ---
 
-#### Phase 5.3：音频特效 MCP（3 tasks）
+#### Phase 5.3：音频特效 MCP（6 tasks）
+
+-> **审计修订 2026-04-17**：基于 DMVideo 源码交叉验证，修正特效表（5→148 种三分类）、删除不存在的「背景音乐增强」、新增三分类体系+每类限一约束+参数系统说明、新增预设查询/管理/VIP 过滤 3 个 task、修正验收标准和 AI 推荐逻辑。
 
 | 编号 | 任务 | 交付物 | 依赖 | 验收标准 |
 |------|------|--------|------|----------|
-| P5.3.1 | 升级 generate_audio_effect handler | `core/mcp/handlers/audio.py` | P1.3 | 支持大叔/女生/机器人/回音等变声特效 |
-| P5.3.2 | 音频变声 AI 推荐 | `core/ai/audio_effect_recommend.py` | P5.3.1 | 「给旁白加一个低沉的声音」→ 推荐「大叔」特效 |
-| P5.3.3 | 音频特效 MCP 单元测试 | `__tests__/mcp/audio.test.ts` | P5.3.1,2 | 生成/AI 推荐全通过 |
+| P5.3.1 | **增强** generate_audio_effect handler | `core/mcp/handlers/audio.py` | P1.3 | 支持全部 **3 类 148 种** 音效（自动分类+参数验证+模糊匹配），每类限一个 |
+| P5.3.2 | 音频特效预设查询 + 管理工具 | `core/mcp/handlers/audio.py` | P5.3.1 | `list_audio_effect_presets`(三分类筛选+VIP) / `get_audio_effects`(查已有) / `remove_audio_effect`(移除) |
+| P5.3.3 | 音频特效 VIP 过滤 | `core/mcp/handlers/audio.py` | P5.3.1 | 免费优先过滤（120 个 VIP 音效不返回给免费用户）+ 声音成曲限制提示 |
+| P5.3.4 | 音频特效 AI 推荐 | `core/ai/audio_effect_recommend.py` | P5.3.1 | 三分类独立推荐（详见推荐逻辑表），含已有特效冲突检测 |
+| P5.3.5 | 音频特效 MCP 单元测试 | `__tests__/mcp/audio_effect.test.ts` | P5.3.1,2,3,4 | 生成/查询/管理/VIP 过滤/AI 推荐全通过 |
+| P5.3.6 | AudioFade 淡入淡出集成验证 | `core/mcp/handlers/audio.py` | P5.3.1 | 确认 fade 与 effect 三分类互不干扰（fade 独立于 AudioEffect 体系） |
 
-**音频特效类型**：
+**音频特效三分类体系**（源码：`pjy/metadata/`）：
 
-| 特效名 | 中文名 | 适用场景 |
-|--------|--------|----------|
-| `大叔` | 大叔音 | 旁白、讲述 |
-| `女生` | 女生音 | 旁白、对话 |
-| `机器人` | 机器人音 | 特效、对话 |
-| `回音` | 回音效果 | 特效、空间感 |
-| `背景音乐增强` | BGM 增强 | 背景音乐 |
+| 类别 | 枚举类 | category_id | category_index | 免费数 | VIP 数 | 总计 |
+|------|--------|-------------|----------------|--------|--------|------|
+| 场景音 | `AudioSceneEffectType` | `sound_effect` | 1 | 12 | 73 | **85** |
+| 音色（变声） | `ToneEffectType` | `tone` | 2 | 14 | 43 | **57** |
+| 声音成曲 | `SpeechToSongType` | `speech_to_song` | 3 | 2 | 4 | **6** |
+| **合计** | — | — | — | **28** | **120** | **148** |
 
----
+**核心约束**（源码：`AudioSegment.add_effect()`）：
 
-#### Phase 5.4：转场 MCP（3 tasks）
+1. **每类限一个**：同一 `category_id` 只能添加一个特效，重复添加抛 `ValueError`
+2. **一个片段最多 3 个特效**：1 × 场景音 + 1 × 音色 + 1 × 声音成曲
+3. **声音成曲限制**：`SpeechToSongType` 的注释标注 "目前不能自动被剪映所识别"，使用时需提示用户
+4. **AudioFade 独立**：淡入淡出（`AudioFade`）不属于 AudioEffect 三大类，独立于 effects 列表
+5. **模糊匹配**：`EffectEnum.from_name()` 支持忽略大小写、空格、下划线的名称查找
 
-| 编号 | 任务 | 交付物 | 依赖 | 验收标准 |
-|------|------|--------|------|----------|
-| P5.4.1 | 升级 generate_transition handler | `core/mcp/handlers/transition.py` | P1.3 | 支持转场类型 + 时长参数 |
-| P5.4.2 | 转场 AI 内容分析推荐 | `core/ai/transition_recommend.py` | P5.4.1 | AI 分析相邻素材内容，推荐最适合的转场 |
-| P5.4.3 | 转场 MCP 单元测试 | `__tests__/mcp/transition.test.ts` | P5.4.1,2 | 生成/AI 推荐全通过 |
+**参数系统**（源码：`EffectMeta.parse_params()`）：
 
-**转场推荐逻辑**：
+- 参数范围：用户传入 **0~100**，自动映射到实际参数范围（`min_value` ~ `max_value`）
+- 不同特效参数数量不同：
 
-```python
-# AI 内容分析推荐（简化版）
-def recommend_transition(segment_a, segment_b):
-    """
-    segment_a: 素材A的元数据 {type: "video"/"image", duration: 微秒, has_audio: bool}
-    segment_b: 素材B的元数据
-    """
-    # 基于素材类型推荐
-    if segment_a["type"] == "video" and segment_b["type"] == "image":
-        return "推镜"  # 视频 → 图片，用推镜
+| 参数数量 | 代表特效 | 参数说明 |
+|----------|----------|----------|
+| 0 个 | 台湾小哥、圣诞精灵、Lofi、民谣 | 无可调参数，直接使用默认值 |
+| 1 个 | 低保真→强弱、机器人→强弱、水下→深度 | 单一效果强度 |
+| 2 个 | 回音→quantity+strength、大叔→音调+音色、颤音→频率+幅度 | 双维度控制 |
+| 3 个 | 8bit→pitch_shift+timbre+strength | 三维度精细控制 |
 
-    if segment_a["type"] == "image" and segment_b["type"] == "video":
-        return "叠化"  # 图片 → 视频，用叠化
+**免费音效一览（28 种）**：
 
-    # 默认推荐
-    return "叠化"
+| 类别 | 音效名 | 参数 |
+|------|--------|------|
+| 场景音 | `8bit` | 3: pitch_shift/timbre/strength |
+| 场景音 | `低保真` | 1: 强弱 |
+| 场景音 | `合成器` | 1: 强弱 |
+| 场景音 | `回音` | 2: quantity/strength |
+| 场景音 | `扩音器` | 1: 强弱 |
+| 场景音 | `水下` | 1: 深度 |
+| 场景音 | `没电了` | 1: 强弱 |
+| 场景音 | `环绕音` | 2: center_position/surrounding_frequency |
+| 场景音 | `电音` | 1: 强弱 |
+| 场景音 | `颤音` | 2: 频率/幅度 |
+| 场景音 | `麦霸` | 2: 空间大小/强弱 |
+| 场景音 | `黑胶` | 2: 强弱/噪点 |
+| 音色 | `台湾小哥` | 0 |
+| 音色 | `圣诞精灵` | 0 |
+| 音色 | `圣诞老人` | 0 |
+| 音色 | `广告男声` | 0 |
+| 音色 | `港普男声` | 0 |
+| 音色 | `老婆婆` | 0 |
+| 音色 | `解说小帅` | 0 |
+| 音色 | `大叔` | 2: 音调/音色 |
+| 音色 | `女生` | 2: 音调/音色 |
+| 音色 | `怪物` | 2: 音调/音色 |
+| 音色 | `机器人` | 1: 强弱 |
+| 音色 | `男生` | 2: 音调/音色 |
+| 音色 | `花栗鼠` | 2: 音调/音色 |
+| 音色 | `萝莉` | 2: 音调/音色 |
+| 声音成曲 | `Lofi` | 0 |
+| 声音成曲 | `民谣` | 0 |
+
+**generate_audio_effect handler 实现要点**：
+
+1. **三分类自动识别**：遍历 `AudioSceneEffectType` → `ToneEffectType` → `SpeechToSongType`，调用 `from_name(effect_type)` 自动匹配分类
+2. **参数验证**：
+   - 数量检查：`len(params) > len(effect_type.value.params)` 抛错误
+   - 范围检查：每个参数值必须在 0~100 之间
+   - 未提供的参数使用默认值
+3. **重复分类检测**：查询片段已有特效列表，若同一 `category_id` 已存在则报错
+4. **模糊匹配**：利用 `EffectEnum.from_name()` 的忽略大小写/空格/下划线能力
+5. **匹配失败兜底**：`from_name()` 抛 `ValueError` 时，返回友好错误（含相近名称建议）
+
+**AI 推荐逻辑**（三分类独立策略）：
+
+```
+用户：「给旁白加一个低沉的声音」
+AI 理解：旁白 → 音色类推荐（tone category），低沉 → 大叔（音调 0.83）
+输出：{
+  effect_type: "大叔",         // ToneEffectType
+  params: [50, 100],           // 音调50%/音色100%（0~100）
+  reason: "大叔音适合低沉旁白"
+}
+
+用户：「加一个回声效果」
+AI 理解：空间感 → 场景音类推荐（sound_effect category），回声 → 回音
+输出：{
+  effect_type: "回音",         // AudioSceneEffectType
+  params: [80, 76],            // quantity80%/strength76%
+  reason: "回音效果增加空间感"
+}
+
+用户：「把这段语音变成音乐」
+AI 理解：成曲 → 声音成曲类推荐（speech_to_song category）
+输出：{
+  effect_type: "Lofi",         // SpeechToSongType
+  params: [],                  // 无参数
+  reason: "Lofi 风格适合轻松氛围",
+  warning: "声音成曲效果可能不被剪映自动识别"  // 特殊警告
+}
+
+冲突检测：
+用户：「再加一个萝莉音」
+AI 检测：已有 大叔（tone 类），萝莉也是 tone 类 →
+输出：{
+  error: "当前片段已有音色类特效「大叔」，每类只能添加一个。请先移除再添加。",
+  suggestion: "可使用 remove_audio_effect 移除已有特效后重试"
+}
 ```
 
-**转场预设类型**：
+**管理工具说明**：
 
-| 转场名 | 中文名 | 适用场景 |
-|--------|--------|----------|
-| `叠化` | Dissolve | 通用，柔和过渡 |
-| `推镜` | Push | 视频→图片/图片→视频 |
-| `闪黑` | Flash | 节奏感切换 |
-| `旋转` | Rotate | 动感和趣味 |
-| `缩放` | Zoom | 强调重点 |
+| 工具 | 功能 | 返回 |
+|------|------|------|
+| `list_audio_effect_presets(category?, vip?)` | 列出音效预设（按分类筛选，VIP 过滤） | `{presets: [{name, category, params, is_vip}]}` |
+| `get_audio_effects(audio_id)` | 查询片段已添加的特效 | `{effects: [{name, category_id, params}]}` |
+| `remove_audio_effect(audio_id, category_id)` | 移除指定分类的特效 | `{code: 0, removed_effect_id}` |
 
 ---
 
-#### Phase 5.5：统一确认流程（3 tasks）
+#### Phase 5.4：转场 MCP（5 tasks）
 
-> 实现「先描述再执行」的用户体验，所有特效操作统一走此流程
+> **数据模型核心差异**：与特效/滤镜不同，转场**无参数系统**（只有 `duration` 可调），但引入 **`is_overlap`** 属性影响时间线计算。转场绑定在**前一个片段**上（`add_transition` 作用于 segment A，实现 A→B 的过渡效果）。仅 `VideoSegment` 支持转场，每个片段最多一个转场。
+>
+> **Phase 1 基线**：`generate_transition(transition_type_name, duration?)` + `list_transition_presets()` 已实现基础功能。`VideoInfoRequest` / `ModifyVideoInfosRequest` schema 已含 `transition: {type, duration}` 字段。
 
 | 编号 | 任务 | 交付物 | 依赖 | 验收标准 |
 |------|------|--------|------|----------|
-| P5.5.1 | 统一确认消息格式 | `core/queryEngine/effectConfirmation.ts` | P3.4.8 | 滤镜/特效/关键帧/转场/音频特效统一使用同一种确认格式 |
-| P5.5.2 | REPL 推荐展示组件 | `components/REPL/EffectRecommendation.vue` | P5.5.1, P3.4.13 | 显示 AI 推荐列表，用户可输入数字选择或输入自定义 |
-| P5.5.3 | 确认超时处理 | `core/queryEngine/effectConfirmation.ts` | P5.5.1 | 30 秒无响应自动取消，提示用户 |
+| P5.4.1 | 升级 generate_transition handler | `core/mcp/handlers/transition.py` | P1.3 | 支持类型名模糊匹配 + duration 覆盖默认值 + is_overlap 返回 |
+| P5.4.2 | 转场预设查询增强 + 管理工具 | `core/mcp/handlers/transition.py` | P5.4.1 | list/get/remove/remove_all + VIP 过滤 + is_overlap 分组 |
+| P5.4.3 | 转场 VIP 过滤 | `core/mcp/middleware/vip_filter.py` | P5.4.1 | 303 VIP 过滤 + 免费 130 列表导出 |
+| P5.4.4 | 转场 AI 内容分析推荐 | `core/ai/transition_recommend.py` | P5.4.1,3 | AI 分析相邻素材内容/风格/节奏，推荐 2-3 个免费转场 |
+| P5.4.5 | 转场 MCP 单元测试 | `__tests__/mcp/transition.test.ts` | P5.4.1-4 | 生成/查询/管理/AI 推荐全通过 |
 
-**统一确认消息格式**：
+**P5.4.1 handler 升级要点**：
+
+```python
+# 转场数据模型（参考 video_segment.py:Transition + effect_meta.py:TransitionMeta）
+class TransitionMeta:
+    name: str           # 转场名称
+    is_vip: bool        # VIP 特权标记
+    resource_id: str    # 资源 ID
+    effect_id: str      # 效果 ID
+    md5: str            # 文件校验
+    default_duration: int  # 默认时长（微秒），范围 300000~4000000（0.3s~4.0s）
+    is_overlap: bool    # 是否与前一片段重叠（影响时间线计算）
+
+class Transition:
+    name, global_id, effect_id, resource_id: str
+    duration: int       # 实际时长，可覆盖 default_duration
+    is_overlap: bool
+
+# handler 核心逻辑
+def generate_transition(transition_type_name: str, duration?: int):
+    # 1. TransitionType.from_name() 模糊匹配（忽略大小写/空格/下划线）
+    transition_type = TransitionType.from_name(transition_type_name)
+    # 2. 若未指定 duration，使用 default_duration
+    # 3. 返回 transition_id + name + default_duration + is_overlap
+```
+
+**关键约束（源码验证）**：
+
+| 约束 | 说明 | 源码位置 |
+|------|------|----------|
+| 一个片段一个转场 | `add_transition()` 重复调用抛 ValueError | `video_segment.py:488-489` |
+| 转场加在**前面**的片段 | A→B 过渡效果通过在 A 上调用 `add_transition()` 实现 | `video_segment.py:479` 注释 |
+| 仅 VideoSegment 可用 | AudioSegment/TextSegment/StickerSegment 无此功能 | `video_segment.py:302` |
+| 无可调参数 | 转场不像特效有 params 系统，只有 duration | `Transition.__init__` 无 params |
+| name 模糊匹配 | `EffectEnum.from_name()` 忽略大小写/空格/下划线 | `effect_meta.py:98-112` |
+
+**P5.4.2 管理工具设计**：
+
+```python
+# 转场管理工具（类比 P5.2.3 关键帧管理）
+list_transition_presets(keyword?, vip_filter?)  # 预设列表查询，支持模糊搜索
+get_transition(transition_id)                    # 获取转场详情（名称/时长/is_overlap/VIP）
+remove_transition(segment_ids)                   # 移除指定片段的转场
+remove_all_transitions()                         # 移除草稿所有转场
+```
+
+**P5.4.3 VIP 过滤**：
+
+```
+转场总计: 433 种
+├── 免费: 130 种（is_vip=False）
+│   ├── is_overlap=True:  92 种（叠化、上移、下移、左移、右移、推近、翻页...）
+│   └── is_overlap=False: 38 种（中心旋转、弹幕转场、打板转场、漩涡、闪白、闪黑...）
+└── VIP:  303 种（is_vip=True）
+```
+
+**P5.4.4 AI 推荐逻辑（需比原版增强）**：
+
+```python
+def recommend_transition(segment_a, segment_b, user_preference=None):
+    """
+    基于「内容分析 + 时间线约束」推荐转场
+
+    输入:
+      segment_a: 前一片段 {type, duration, has_audio, content_tags?}
+      segment_b: 后一片段 {type, duration, has_audio, content_tags?}
+      user_preference: 用户偏好（可选）
+
+    推荐策略:
+      1. VIP 过滤: 默认只推荐 130 种免费转场
+      2. 时长兼容: 转场时长不应超过较短片段的 50%
+         - 片段时长 < 1s: 不推荐转场（空间不足）
+         - 片段时长 1~3s: 推荐 default_duration ≤ 0.8s 的转场
+         - 片段时长 > 3s: 无限制
+      3. is_overlap 语义:
+         - overlap=True（叠化/滑动/推近等）: 时间线无缝，适合连续叙事
+         - overlap=False（闪白/闪黑/弹幕转场等）: 插入式效果，适合强调切换
+      4. 风格匹配:
+         - video→video: 叠化/推近/拉远（叙事型）或 故障/雪花故障（风格型）
+         - video→image: 推近/闪白（焦点转移）
+         - image→video: 叠化/色彩溶解（柔和进入）
+         - image→image: 闪白/翻页/窗格（相册风格）
+      5. 返回 2-3 个推荐，附带推荐理由
+    """
+```
+
+**免费转场预设分类（130 种，按推荐场景分组）**：
+
+| 分类 | 代表转场 | 数量 | 适用场景 | is_overlap |
+|------|----------|------|----------|------------|
+| 溶解/叠加 | 叠化、叠加、色彩溶解 I/II/III | 5 | 通用柔和过渡 | True |
+| 方向移动 | 上移、下移、左移、右移、向左/右/上/下 | 12 | 叙事推进 | True |
+| 推拉 | 推近、拉远 | 2 | 聚焦/远离 | False |
+| 闪切 | 闪白、闪白 II、闪黑、泛白、白光快闪 | 5 | 节奏感/强调 | Mixed |
+| 擦除 | 向上/下/左/右擦除、画笔擦除、渐变擦除 | 7 | 画面揭示 | True |
+| 分割 | 分割 I-IV、横向/竖向/斜向/矩形分割 | 8 | 画面分裂 | True |
+| 旋转 | 中心旋转、顺时针/逆时针旋转 I/II | 5 | 动感 | Mixed |
+| 翻转/翻页 | 翻页、上下翻页、镜像翻转、翻篇 | 4 | 书页/卡片效果 | True |
+| 故障风格 | 故障、雪花故障、电视故障 I/II、故障拼贴 | 5 | 科技感/Vlog | Mixed |
+| 几何 | 马赛克、百叶窗、窗格、立方体 | 4 | 创意/结构化 | True |
+| 粒子/特效 | 粒子、星星 I/II、爱心 I/II/上升、云朵 | 7 | 浪漫/梦幻 | Mixed |
+| 流动/模糊 | 模糊、横向/竖向模糊、水波卷动/向右/向左 | 6 | 柔和过渡 | Mixed |
+| 漫画风格 | 动漫云朵、动漫漩涡、动漫火焰、动漫闪电 | 4 | 二次元风格 | False |
+| 拍摄器风格 | 打板转场 I/II、弹幕转场、拍摄器、气泡转场 | 5 | 影视/弹幕 | False |
+| 其他 | 压缩、拉伸 I/II、风车、震动、抖动 I/II... | ~51 | 创意过渡 | Mixed |
+
+> **注**：Phase 1 测试 T6.3 使用 `generate_transition("淡入淡出", 500000)`，但 TransitionType 中不存在"淡入淡出"，应修正为 `generate_transition("叠化", 500000)`。推荐列表中的"推镜"也不存在，正确名称为"推近"。
+
+---
+
+#### Phase 5.5：统一确认流程（5 tasks）
+
+> 实现「先描述再执行」的用户体验，为特效类操作提供推荐确认层。同时借鉴 DMVideo DraftReviewStep 的 Pipeline 暂停模式，定义确认系统在 Agentic Loop 中的位置。
+
+| 编号 | 任务 | 交付物 | 依赖 | 验收标准 |
+|------|------|--------|------|----------|
+| P5.5.1 | 确认流程架构 + 状态机 | `core/queryEngine/effectConfirmation.ts` | P3.4.7, P3.4.8, P5.1.7, P5.3.4, P5.4.4 | 确认状态机（pending→confirmed/cancelled/timed_out）+ 与权限系统交互定义 + 触发条件分类 |
+| P5.5.2 | 推荐调度 Facade | `core/queryEngine/recommendFacade.ts` | P5.5.1 | 统一调度 recommend_effects / recommend_audio_effect / recommend_transition，按类型路由到对应推荐引擎 |
+| P5.5.3 | REPL 确认 UI 组件 | `components/REPL/EffectRecommendation.vue` | P5.5.1, P5.5.2, P3.4.13 | 5 种确认格式渲染 + 用户输入处理（数字选择/自定义描述） |
+| P5.5.4 | 确认超时与异常处理 | `core/queryEngine/effectConfirmation.ts` | P5.5.1 | 可配置超时（默认 30s）+ 打字暂停计时 + 取消后推荐状态缓存 + 超时前 5s 提醒 |
+| P5.5.5 | 确认流程集成测试 | `__tests__/mcp/confirmation.test.ts` | P5.5.1-4 | 5 种类型确认 + 批量操作 + 超时 + 权限交互 + 修改已有效果 |
+
+**P5.5.1 确认流程架构设计**：
+
+确认系统在 Agentic Loop 中的位置（与权限系统的关系）：
+
+```
+用户输入 → AI 理解意图 → Tool 调用决策
+                              │
+                 ┌────────────┴────────────┐
+                 │ 是否为特效类工具？         │
+                 │ (generate_*_effect/      │
+                 │  generate_*_filter/      │
+                 │  generate_transition/    │
+                 │  generate_keyframe)      │
+                 └────┬──────────────┬─────┘
+                      │ 是            │ 否
+                      ▼               ▼
+           ┌──────────────┐    ┌──────────────┐
+           │ ① 确认系统    │    │ 权限系统      │
+           │ (UX 层)       │    │ (安全层)      │
+           │ 推荐→选择→参数│    │ Allow/Ask/Deny│
+           └──────┬───────┘    └──────┬───────┘
+                  │ 确认后             │
+                  ▼                   │
+           ┌──────────────┐           │
+           │ ② 权限系统    │◄──────────┘
+           │ (安全层)      │
+           │ 检查确认结果   │
+           └──────┬───────┘
+                  │ Allow
+                  ▼
+           ┌──────────────┐
+           │ ③ Tool 执行   │
+           └──────────────┘
+```
+
+**执行顺序**：特效类工具先经过确认系统（UX 层）→ 再经过权限系统（安全层）→ 最后执行。
+
+**触发条件分类**：
+
+| 场景 | 用户意图明确度 | 确认策略 | 示例 |
+|------|--------------|---------|------|
+| 模糊意图 | 低 | 推荐 2-3 项 → 用户选择 | "加个复古感觉的滤镜" |
+| 类型明确，参数未定 | 中 | 推荐 1-2 项参数方案 → 用户选择 | "用复古滤镜" |
+| 完全明确 | 高 | 直接执行，跳过确认 | "用复古滤镜，强度 80%" |
+| 批量操作 | — | 一次确认，批量执行 | "所有视频加复古滤镜" |
+| 修改已有效果 | — | 展示当前值 → 确认修改 | "把滤镜强度改为 50%" |
+
+**确认状态机**：
+
+```typescript
+// core/queryEngine/effectConfirmation.ts
+type ConfirmationState =
+  | { status: 'idle' }
+  | { status: 'pending'; type: EffectType; recommendations: Recommendation[]; startedAt: number }
+  | { status: 'confirmed'; selection: UserSelection }
+  | { status: 'cancelled'; reason: 'user_cancel' | 'timeout' | 'error' }
+  | { status: 'timed_out'; cachedRecommendations: Recommendation[] }
+
+type EffectType = 'filter' | 'scene_effect' | 'character_effect' | 'keyframe' | 'transition' | 'audio_effect'
+```
+
+**P5.5.2 推荐调度 Facade**：
+
+Phase 5 的 3 个推荐引擎使用不同接口，需要统一调度：
+
+| 推荐引擎 | 来源 | 接口 | 确认类型 |
+|----------|------|------|---------|
+| 滤镜/特效推荐 | P5.1.7 `recommend_effects` | `(intent, target_type, context)` | 列表选择 |
+| 音频特效推荐 | P5.3.4 `audio_effect_recommend` | `(intent, category, context)` | 列表选择 + 冲突检测 |
+| 转场推荐 | P5.4.4 `recommend_transition` | `(segment_a, segment_b, preference)` | 列表选择 + is_overlap 提示 |
+| 关键帧推荐 | P5.2.4 AI 描述 | `(property, description)` | 时间线确认 |
+
+```typescript
+// core/queryEngine/recommendFacade.ts
+async function dispatchRecommendation(
+  type: EffectType,
+  intent: string,
+  context: RecommendationContext
+): Promise<RecommendationResult> {
+  switch (type) {
+    case 'filter':
+    case 'scene_effect':
+    case 'character_effect':
+      return mcpClient.call('recommend_effects', { intent, target_type: type, context })
+    case 'audio_effect':
+      return mcpClient.call('recommend_audio_effect', { intent, context })
+    case 'transition':
+      return mcpClient.call('recommend_transition', {
+        segment_a: context.previousSegment,
+        segment_b: context.currentSegment,
+        preference: intent
+      })
+    case 'keyframe':
+      // 关键帧无推荐引擎，直接由 AI 生成参数
+      return generateKeyframeRecommendation(intent, context)
+  }
+}
+```
+
+**P5.5.3 确认 UI 格式 — 按类型分类**：
+
+**类型 A：列表选择型**（滤镜 / 特效 / 转场 / 音频特效）
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -5976,25 +6349,97 @@ def recommend_transition(segment_a, segment_b):
 │      └─ 理由：低饱和度 + 暗角，营造电影氛围                   │
 │                                                             │
 │ 请输入数字选择（1-3），或输入自定义描述：                       │
+│ ⏱ 30 秒后自动取消                                            │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**用户确认流程**：
+**类型 B：转场特化型**（含 is_overlap 和前一片段信息）
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 🔀 转场推荐（素材[1] → 素材[2]）                              │
+├─────────────────────────────────────────────────────────────┤
+│ 根据相邻素材风格推荐以下转场：                                  │
+│                                                             │
+│   1. 叠化（2.0s）                                            │
+│      └─ 理由：平滑过渡，适合同风格素材                          │
+│      └─ ⚡ 重叠式（is_overlap=true）                          │
+│                                                             │
+│   2. 推近（1.0s）                                            │
+│      └─ 理由：推进感强，适合场景推进                            │
+│      └─ 🔲 插入式（is_overlap=false）                         │
+│                                                             │
+│ 请输入数字选择（1-2），或输入自定义转场名：                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**类型 C：关键帧时间线型**（不使用列表选择）
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 📐 关键帧确认                                                │
+├─────────────────────────────────────────────────────────────┤
+│ 属性：缩放 (UNIFORM_SCALE)                                   │
+│ 目标：素材[1]                                                │
+│                                                             │
+│   时间轴：                                                   │
+│   0.0s ──● 1.0 ──● 1.5 ──● 1.8 ──● 1.0                    │
+│          │          │          │          │                   │
+│        [起始]    [放大]     [最大]     [还原]                  │
+│                                                             │
+│ 确认此关键帧方案？（Y/n）或描述修改：                           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**类型 D：音频特效型**（含分类冲突检测）
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 🔊 音频特效推荐                                              │
+├─────────────────────────────────────────────────────────────┤
+│ 根据描述推荐以下音效：                                        │
+│                                                             │
+│   1. 回声 [场景音]                                           │
+│      └─ 理由：空旷场景感，适合户外素材                          │
+│                                                             │
+│   2. 温暖 [音色]                                             │
+│      └─ 理由：温暖音色，适合人声旁白                           │
+│                                                             │
+│   ⚠ 当前已有「场景音」类型音效，选择 1 将替换                   │
+│                                                             │
+│ 请输入数字选择（1-2），或输入自定义描述：                       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**完整确认流程**（参考 DMVideo DraftReviewStep 的 Pipeline 暂停模式）：
 
 ```
 用户：「给视频加一个复古滤镜」
          │
          ▼
-AI 理解意图 → 调用 recommend_effects("复古", target_type="filter") → 获取推荐列表
+AI 理解意图 → 判断意图明确度（模糊）→ 触发确认流程
          │
          ▼
-显示确认界面 → 用户输入「1」选择「复古」
+① 推荐调度 Facade → recommend_effects("复古", target_type="filter") → 获取推荐列表
          │
          ▼
-AI 调用 generate_video_filter("复古", intensity=80)
+② 确认状态机 → status: 'pending' → 显示确认 UI（类型 A 格式）
          │
          ▼
-显示执行结果：「✅ 已为素材[1]应用『复古』滤镜，强度 80%」
+③ Agentic Loop 暂停 → 等待用户响应（参考 DMVideo DraftReviewStep 的阻塞模式）
+    ├── 用户输入「1」→ status: 'confirmed' → 提取参数 {name: "复古", intensity: 80}
+    ├── 用户输入「用胶片，强度 60」→ status: 'confirmed' → 覆盖推荐 {name: "胶片", intensity: 60}
+    ├── 用户超时 → status: 'timed_out' → 缓存推荐 → 提示用户
+    └── 用户取消 → status: 'cancelled' → AI 提供替代方案
+         │（confirmed）
+         ▼
+④ 权限系统检查 → Allow（用户已确认，自动放行特效类工具）
+         │
+         ▼
+⑤ AI 调用 generate_video_filter("复古", intensity=80)
+         │
+         ▼
+⑥ 显示执行结果：「✅ 已为素材[1]应用『复古』滤镜，强度 80%」
 ```
 
 ---
@@ -6020,17 +6465,17 @@ AI 调用 generate_video_filter("复古", intensity=80)
 
 ---
 
-#### Phase 5 任务总览（21 tasks）
+#### Phase 5 任务总览（29 tasks）
 
 | Phase | 任务数 | 核心交付 |
 |-------|--------|----------|
 | P5.1 滤镜/特效 MCP 增强 | 8 | 滤镜 972 + 画面特效 1097 + 人物特效 240，具名参数 + VIP 过滤 + AI 推荐 |
-| P5.2 关键帧 MCP | 4 | 9 种属性动画 + AI 描述 |
-| P5.3 音频特效 MCP | 3 | 4 种变声特效 + AI 推荐 |
-| P5.4 转场 MCP | 3 | 转场生成 + AI 内容分析推荐 |
-| P5.5 统一确认流程 | 3 | 先描述再执行 + 推荐展示 |
+| P5.2 关键帧 MCP | 5 | 11 种属性动画 + 管理工具 + AI 描述 |
+| P5.3 音频特效 MCP | 6 | 3 类 148 种音效（28 免费）+ 参数系统 + VIP 过滤 + AI 推荐 |
+| P5.4 转场 MCP | 5 | 433 种转场（130 免费）+ is_overlap + VIP 过滤 + AI 推荐 + 管理工具 |
+| P5.5 统一确认流程 | 5 | 确认状态机 + 推荐 Facade + 4 类 UI 格式 + 超时处理 + 集成测试 |
 | P5.6 E2E + 最小化 UI | 3 | 全流程 E2E + 特效轨道 |
-| **合计** | **21** | 特效/滤镜/关键帧完整功能 |
+| **合计** | **29** | 特效/滤镜/关键帧/音效/转场/确认流程完整功能 |
 
 ---
 
@@ -6043,26 +6488,34 @@ AI 调用 generate_video_filter("复古", intensity=80)
 ├── P5.1.3 generate_video_character_effect handler 新增（人物特效 240 预设）
 ├── P5.1.4 list_filter_presets AI 增强（972 预设模糊搜索 + VIP）
 ├── P5.1.5 list_video_effect_presets AI 增强（画面/人物分离 + 1337 预设）
-├── P5.2.1 generate_keyframe handler 升级
-├── P5.2.2 generate_audio_keyframe handler 升级
-├── P5.3.1 generate_audio_effect handler 升级
-└── P5.4.1 generate_transition handler 升级
+├── P5.2.1 generate_keyframe handler 实现（11 种属性，Video/Text/Sticker）
+├── P5.2.2 generate_audio_keyframe handler 实现（Audio volume only）
+├── P5.3.1 generate_audio_effect handler 增强（3 类 148 种自动分类+参数验证）
+├── P5.3.2 音频特效预设查询 + 管理工具（list/get/remove）
+├── P5.4.1 generate_transition handler 升级（from_name 模糊匹配 + is_overlap 返回）
+└── P5.4.2 转场预设查询增强 + 管理工具（list/get/remove/remove_all + VIP 过滤）
 
 第2轮迭代（中间件 + AI 推荐 + 确认）
 ├── P5.1.6 VIP 过滤 + 错误处理中间件
 ├── P5.1.7 滤镜/特效 AI 推荐引擎（GLM 模型集成）
 ├── P5.1.8 滤镜/特效 MCP 单元测试
-├── P5.2.3 关键帧属性 AI 描述
-├── P5.2.4 关键帧 MCP 单元测试
-├── P5.3.2 音频变声 AI 推荐
-├── P5.3.3 音频特效 MCP 单元测试
-├── P5.4.2 转场 AI 内容分析推荐
-├── P5.4.3 转场 MCP 单元测试
-├── P5.5.1 统一确认消息格式
-├── P5.5.2 REPL 推荐展示组件
-└── P5.5.3 确认超时处理
+├── P5.2.3 关键帧管理 MCP 工具（get/clear/list）
+├── P5.2.4 关键帧属性 AI 描述
+├── P5.2.5 关键帧 MCP 单元测试
+├── P5.3.3 音频特效 VIP 过滤（120 VIP + 声音成曲限制提示）
+├── P5.3.4 音频特效 AI 推荐（三分类独立策略 + 冲突检测）
+├── P5.3.5 音频特效 MCP 单元测试
+├── P5.3.6 AudioFade 淡入淡出集成验证
+├── P5.4.3 转场 VIP 过滤（303 VIP 过滤 + 免费 130 列表）
+├── P5.4.4 转场 AI 内容分析推荐（is_overlap 语义 + 时长兼容 + 风格匹配）
+├── P5.4.5 转场 MCP 单元测试
+├── P5.5.1 确认流程架构 + 状态机（确认 vs 权限系统定位 + 触发条件分类）
+├── P5.5.2 推荐调度 Facade（统一 recommend_effects/audio/transition 三引擎）
+└── P5.5.3 REPL 确认 UI 组件（4 类格式：列表/转场/关键帧时间线/音频）
 
-第3轮迭代（E2E + UI）
+第3轮迭代（确认收尾 + E2E + UI）
+├── P5.5.4 确认超时与异常处理（可配置 + 打字暂停 + 缓存推荐）
+├── P5.5.5 确认流程集成测试（5 类型 + 批量 + 超时 + 权限交互）
 ├── P5.6.1 特效全流程 E2E 测试
 ├── P5.6.2 时间线特效轨道 UI
 └── P5.6.3 特效 REPL 自然语言测试
