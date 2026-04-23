@@ -31,16 +31,16 @@ mock.module("src/services/tokenEstimation.ts", () => ({
 }));
 
 // Mock slowOperations to avoid bun:bundle import
-mock.module("src/utils/slowOperations.ts", () => ({
+mock.module('src/utils/slowOperations.ts', () => ({
   jsonStringify: JSON.stringify,
   jsonParse: JSON.parse,
   slowLogging: { enabled: false },
   clone: (v: any) => structuredClone(v),
   cloneDeep: (v: any) => structuredClone(v),
-  callerFrame: () => "",
+  callerFrame: () => '',
   SLOW_OPERATION_THRESHOLD_MS: 100,
   writeFileSync_DEPRECATED: () => {},
-}));
+}))
 
 const {
   getTokenCountFromUsage,
