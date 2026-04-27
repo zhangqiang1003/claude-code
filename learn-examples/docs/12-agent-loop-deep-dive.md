@@ -410,8 +410,8 @@ for await (const event of stream) {
 |-----------|---------|
 | Thought | 发请求 → 等响应（LLM 在"思考"） |
 | Action | 执行工具 |
-| Observation | 注入 tool_result |
-
+| Observation | 注入  |
+tool_result
 然后回到 Thought（下一轮请求），循环往复，直到 `stop_reason === 'end_turn'`。
 
 ---
