@@ -2,6 +2,7 @@
   "permissions": {
     "allow": [
       "Bash(npx bun run learn-examples/01-minimal-agent.ts)",
+<<<<<<< HEAD
       "Bash(npx bun run learn-examples/02-real-llm-agent.ts)",
       "Read(//c/Users/admin/.claude/**)",
       "Bash(timeout 30 bun run learn-examples/02-real-llm-agent.ts)",

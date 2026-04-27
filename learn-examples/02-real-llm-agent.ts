@@ -9,7 +9,10 @@
  */
 
 import * as readline from 'readline'
+<<<<<<< HEAD
 import { appendFileSync, mkdirSync } from 'node:fs'
+=======
+>>>>>>> main
 
 // ============================================
 // 配置
@@ -208,6 +211,7 @@ async function callGLM(messages: Message[], tools: Tool[]): Promise<Message> {
       tools: toolsToGLMFormat(tools),
       temperature: 0.7,
       max_tokens: 1024,
+<<<<<<< HEAD
       stream: true,
     }),
   })
@@ -309,16 +313,57 @@ async function callGLM(messages: Message[], tools: Tool[]): Promise<Message> {
           type: 'tool_use' as const,
           name: tc.name,
           input: JSON.parse(tc.arguments),
+=======
+    }),
+  })
+
+  const data = await response.json() as any
+  const elapsed = Date.now() - startTime
+  console.log(`✅ GLM 响应 (${elapsed}ms)`)
+
+  // 调试：打印完整响应
+  console.log('📦 响应数据:', JSON.stringify(data, null, 2).slice(0, 500))
+
+  if (!response.ok) {
+    console.error('❌ GLM API 错误:', data)
+    return {
+      role: 'assistant',
+      content: `API 调用失败: ${JSON.stringify(data)}`
+    }
+  }
+
+  // 3. 解析响应
+  const choice = data.choices[0]
+
+  if (choice.finish_reason === 'tool_calls' && choice.message.tool_calls) {
+    // LLM 想要调用工具
+    const toolCalls = choice.message.tool_calls
+    return {
+      role: 'assistant',
+      content: [
+        { type: 'text', text: choice.message.content || '' },
+        ...toolCalls.map(tc => ({
+          type: 'tool_use' as const,
+          name: tc.function.name,
+          input: JSON.parse(tc.function.arguments),
+>>>>>>> main
           tool_use_id: tc.id,
         }))
       ]
     }
   }
 
+<<<<<<< HEAD
   // 普通文本回答
   return {
     role: 'assistant',
     content: fullContent || '（无响应）'
+=======
+  // LLM 直接回答
+  return {
+    role: 'assistant',
+    content: choice.message.content || '（无响应）'
+>>>>>>> main
   }
 }
 
@@ -464,6 +509,7 @@ async function* agentLoop(
 }
 
 // ============================================
+<<<<<<< HEAD
 // Memory 持久化（参考 Claude Code 三层方案）
 // ============================================
 //
@@ -646,6 +692,8 @@ class MemoryManager {
 }
 
 // ============================================
+=======
+>>>>>>> main
 // REPL
 // ============================================
 
@@ -668,6 +716,7 @@ async function main() {
   console.log('📝 使用模型: glm-4-flash')
   console.log('🔑 API Key: ' + (GLM_API_KEY ? '已配置 ✓' : '未配置 ❌'))
 
+<<<<<<< HEAD
   // 初始化 Memory Manager（Claude Code 三层方案）
   const memory = new MemoryManager({
     transcriptPath: TRANSCRIPT_FILE,
@@ -714,11 +763,21 @@ async function main() {
 
     // 追加用户消息（实时写入 JSONL）
     memory.append({ role: 'user', content: userInput })
+=======
+  const messages: Message[] = [
+    { role: 'system', content: buildSystemPrompt() }
+  ]
+
+  while (true) {
+    const userInput = await readUserInput()
+    if (userInput === '退出') break
+>>>>>>> main
 
     for await (const event of agentLoop(messages, userInput)) {
       switch (event.type) {
         case 'tool_result':
           console.log(`📥 工具结果: ${JSON.stringify(event.data)}`)
+<<<<<<< HEAD
           // 实时追加 assistant 消息 + tool_result
           break
         case 'completed':
@@ -734,6 +793,11 @@ async function main() {
             messages.length = 0
             messages.push(...compacted)
           }
+=======
+          break
+        case 'completed':
+          console.log(`\n🎯 最终回答: ${event.data}`)
+>>>>>>> main
           break
         case 'max_iterations':
           console.log(`⚠️ ${event.data}`)
