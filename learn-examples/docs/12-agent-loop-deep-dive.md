@@ -262,7 +262,7 @@ while (true) {
     messages.push({ role: 'user', content: results });
   }
 }
-
+```
 ---
 
 ## Q6: 流式模式下，何时才能知道 stop_reason？
@@ -286,7 +286,7 @@ message_stop ← 流完全结束
 
 ### Claude Code 源码注释（claude.ts）
 
-​```typescript
+```typescript
 // message_delta arrives after content_block_stop with the real values.
 // Messages are created at content_block_stop from partialMessage,
 // which was set at message_start before any tokens were generated
